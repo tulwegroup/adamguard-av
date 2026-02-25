@@ -1,0 +1,98 @@
+// Antivirus Dashboard Prisma Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Threat {
+  id          String   @id @default(cuid())
+  name        String
+  type        String   // Virus, Trojan, Worm, Ransomware, PUP, Adware
+  severity    String   // Critical, High, Medium, Low
+  path        String
+  hash        String?
+  size        Int?
+  status      String   @default("active") // active, quarantined, removed, false_positive
+  detectedAt  DateTime @default(now())
+  quarantined Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Scan {
+  id            String    @id @default(cuid())
+  type          String    // quick, full, custom
+  status        String    @default("pending") // pending, running, completed, cancelled, error
+  filesScanned  Int       @default(0)
+  threatsFound  Int       @default(0)
+  filesSkipped  Int       @default(0)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  path          String?   // For custom scans
+  duration      Int?      // Duration in seconds
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model QuarantinedFile {
+  id            String   @id @default(cuid())
+  originalPath  String
+  threatName    String
+  threatType    String
+  quarantinedAt DateTime @default(now())
+  size          Int
+  hash          String?
+  restored      Boolean  @default(false)
+  restoredAt    DateTime?
+  deletedAt     DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model SecurityEvent {
+  id          String   @id @default(cuid())
+  eventType   String   // threat_detected, scan_completed, file_blocked, quarantine_action, settings_changed
+  title       String
+  description String?
+  severity    String   // critical, high, medium, low, info
+  timestamp   DateTime @default(now())
+  processName String?
+  filePath    String?
+  userId      String?
+  metadata    String?  // JSON string for additional data
+  createdAt   DateTime @default(now())
+}
+
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  category  String   // protection, scan, notifications, updates, advanced
+  updatedAt DateTime @updatedAt
+}
+
+model TeamMember {
+  id         String   @id @default(cuid())
+  name       String
+  email      String   @unique
+  role       String   // Admin, Analyst, Viewer
+  avatar     String?
+  lastActive DateTime?
+  status     String   @default("offline") // online, offline, away
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Exclusion {
+  id        String   @id @default(cuid())
+  path      String
+  type      String   // file, folder, extension
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

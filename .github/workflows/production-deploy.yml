@@ -1,0 +1,566 @@
+# AdamGuard Pro - Production Deployment with SSL
+# This workflow sets up a complete production environment with:
+# - Application Load Balancer with HTTPS
+# - SSL Certificate via AWS Certificate Manager
+# - Route 53 DNS configuration (optional)
+# - Auto-scaling and health checks
+
+name: AdamGuard Production Deploy
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Custom domain (e.g., adamguard.yourdomain.com)'
+        required: false
+        default: ''
+      hosted_zone_id:
+        description: 'Route 53 Hosted Zone ID (optional, for DNS)'
+        required: false
+        default: ''
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: adamguard-pro
+
+jobs:
+  # ===========================================
+  # Build and Push Docker Image
+  # ===========================================
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build application
+        run: bun run build
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || true
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          provenance: false
+          sbom: false
+
+  # ===========================================
+  # Deploy Production Infrastructure
+  # ===========================================
+  deploy-production:
+    name: Deploy Production Infrastructure
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Create ECS Cluster
+        run: |
+          aws ecs create-cluster --cluster-name adamguard-prod --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster exists"
+
+      - name: Create IAM Role for ECS Task Execution
+        run: |
+          if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
+            cat > /tmp/trust-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+              "Action": "sts:AssumeRole"
+            }]
+          }
+          EOF
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file:///tmp/trust-policy.json || true
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          fi
+          
+          # Add inline policy for Secrets Manager access
+          cat > /tmp/secrets-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+              ],
+              "Resource": [
+                "arn:aws:secretsmanager:*:*:secret:adamguard/*"
+              ]
+            }]
+          }
+          EOF
+          
+          aws iam put-role-policy \
+            --role-name ecsTaskExecutionRole \
+            --policy-name SecretsManagerAccess \
+            --policy-document file:///tmp/secrets-policy.json || true
+          
+          echo "✅ IAM role configured with Secrets Manager access"
+
+      - name: Wait for IAM propagation
+        run: sleep 15
+
+  # ===========================================
+  # Setup Network and SSL
+  # ===========================================
+  setup-network:
+    name: Setup Network & SSL
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    outputs:
+      vpc_id: ${{ steps.network.outputs.vpc_id }}
+      subnet_1: ${{ steps.network.outputs.subnet_1 }}
+      subnet_2: ${{ steps.network.outputs.subnet_2 }}
+      subnet_3: ${{ steps.network.outputs.subnet_3 }}
+      security_group: ${{ steps.network.outputs.sg_id }}
+      alb_dns: ${{ steps.alb.outputs.dns_name }}
+      certificate_arn: ${{ steps.ssl.outputs.certificate_arn }}
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Setup Network Resources
+        id: network
+        run: |
+          set -e
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          echo "VPC_ID=$VPC_ID"
+          
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "ERROR: Could not find default VPC"
+            exit 1
+          fi
+          
+          # Get subnets in different AZs for ALB
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=default-for-az,Values=true" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]}
+          SUBNET_3=${SUBNET_ARRAY[2]:-${SUBNET_ARRAY[1]}}
+          
+          echo "Subnets: $SUBNET_1, $SUBNET_2, $SUBNET_3"
+          
+          # Create or get security group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-prod-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)
+          
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            echo "Creating production security group..."
+            SG_ID=$(aws ec2 create-security-group --group-name adamguard-prod-sg --description "AdamGuard Production - ALB and ECS" --vpc-id $VPC_ID --query "GroupId" --output text)
+            
+            sleep 5
+            
+            # Allow HTTP (for ACME challenges and redirect)
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 || true
+            # Allow HTTPS
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0 || true
+            # Allow internal traffic
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 10.0.0.0/8 || true
+          fi
+          
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "subnet_1=$SUBNET_1" >> $GITHUB_OUTPUT
+          echo "subnet_2=$SUBNET_2" >> $GITHUB_OUTPUT
+          echo "subnet_3=$SUBNET_3" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Request SSL Certificate
+        id: ssl
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          
+          if [ -z "$DOMAIN" ]; then
+            echo "No custom domain specified, using self-signed certificate approach"
+            # For demo without custom domain, we'll use HTTP with ALB
+            echo "certificate_arn=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Checking for existing certificate for $DOMAIN..."
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" --output text 2>/dev/null | head -1)
+          
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "Requesting new SSL certificate..."
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "$DOMAIN" \
+              --validation-method DNS \
+              --subject-alternative-names "*.$DOMAIN" \
+              --query "CertificateArn" \
+              --output text)
+            
+            echo "Certificate requested: $CERT_ARN"
+            echo ""
+            echo "=========================================="
+            echo "IMPORTANT: DNS Validation Required"
+            echo "=========================================="
+            echo "Please add the following CNAME record to your DNS:"
+            
+            VALIDATION=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.DomainValidationOptions[0]" --output json)
+            echo "$VALIDATION"
+            echo "=========================================="
+          fi
+          
+          echo "certificate_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create Application Load Balancer
+        id: alb
+        run: |
+          SG_ID="${{ steps.network.outputs.sg_id }}"
+          SUBNET_1="${{ steps.network.outputs.subnet_1 }}"
+          SUBNET_2="${{ steps.network.outputs.subnet_2 }}"
+          
+          # Check if ALB exists
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || true)
+          
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            echo "Creating Application Load Balancer..."
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name adamguard-alb \
+              --subnets $SUBNET_1 $SUBNET_2 \
+              --security-groups $SG_ID \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text)
+          fi
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+          echo "ALB DNS: $ALB_DNS"
+          
+          # Create target group for ECS
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || true)
+          
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            echo "Creating target group..."
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id ${{ steps.network.outputs.vpc_id }} \
+              --target-type ip \
+              --health-check-path "/" \
+              --health-check-interval-seconds 30 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+          
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+          echo "target_group_arn=$TG_ARN" >> $GITHUB_OUTPUT
+          echo "dns_name=$ALB_DNS" >> $GITHUB_OUTPUT
+          
+          # Create HTTP listener (always, for redirect or direct access)
+          HTTP_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Protocol=='HTTP'].ListenerArn" --output text 2>/dev/null || true)
+          
+          CERT_ARN="${{ steps.ssl.outputs.certificate_arn }}"
+          
+          if [ -n "$CERT_ARN" ]; then
+            # With SSL - redirect HTTP to HTTPS
+            if [ -z "$HTTP_LISTENER" ] || [ "$HTTP_LISTENER" = "None" ]; then
+              aws elbv2 create-listener \
+                --load-balancer-arn $ALB_ARN \
+                --protocol HTTP \
+                --port 80 \
+                --default-actions Type=redirect,RedirectConfig='{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}' || true
+            fi
+            
+            # Create HTTPS listener
+            HTTPS_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Protocol=='HTTPS'].ListenerArn" --output text 2>/dev/null || true)
+            if [ -z "$HTTPS_LISTENER" ] || [ "$HTTPS_LISTENER" = "None" ]; then
+              aws elbv2 create-listener \
+                --load-balancer-arn $ALB_ARN \
+                --protocol HTTPS \
+                --port 443 \
+                --certificates CertificateArn=$CERT_ARN \
+                --default-actions Type=forward,TargetGroupArn=$TG_ARN || true
+            fi
+          else
+            # Without SSL - direct HTTP
+            if [ -z "$HTTP_LISTENER" ] || [ "$HTTP_LISTENER" = "None" ]; then
+              aws elbv2 create-listener \
+                --load-balancer-arn $ALB_ARN \
+                --protocol HTTP \
+                --port 80 \
+                --default-actions Type=forward,TargetGroupArn=$TG_ARN || true
+            fi
+          fi
+
+  # ===========================================
+  # Deploy ECS Service
+  # ===========================================
+  deploy-ecs:
+    name: Deploy ECS Service
+    needs: [build-and-push, setup-network]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Create CloudWatch Log Group
+        run: |
+          aws logs create-log-group --log-group-name /ecs/adamguard-prod --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Log group exists"
+
+      - name: Create AWS Secrets for Application
+        run: |
+          echo "Checking/Creating AWS Secrets Manager secrets..."
+          
+          # Generate secure random secrets
+          NEXTAUTH_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+          JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+          
+          # Create or update nextauth secret
+          if aws secretsmanager describe-secret --secret-id adamguard/nextauth --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Secret adamguard/nextauth already exists"
+          else
+            echo "Creating secret adamguard/nextauth..."
+            aws secretsmanager create-secret \
+              --name adamguard/nextauth \
+              --secret-string "$NEXTAUTH_SECRET" \
+              --description "AdamGuard Pro NextAuth Secret" \
+              --region ${{ env.AWS_REGION }} || true
+          fi
+          
+          # Create or update jwt secret
+          if aws secretsmanager describe-secret --secret-id adamguard/jwt --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "Secret adamguard/jwt already exists"
+          else
+            echo "Creating secret adamguard/jwt..."
+            aws secretsmanager create-secret \
+              --name adamguard/jwt \
+              --secret-string "$JWT_SECRET" \
+              --description "AdamGuard Pro JWT Secret" \
+              --region ${{ env.AWS_REGION }} || true
+          fi
+          
+          echo "✅ Secrets configured"
+
+      - name: Get Target Group ARN
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+          echo "TARGET_GROUP_ARN=$TG_ARN" >> $GITHUB_ENV
+
+      - name: Register ECS Task Definition
+        run: |
+          cat > /tmp/task-definition.json << EOF
+          {
+            "family": "adamguard-prod-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "1024",
+            "memory": "2048",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "taskRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [
+              {
+                "name": "adamguard-app",
+                "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}",
+                "essential": true,
+                "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+                "environment": [
+                  {"name": "NODE_ENV", "value": "production"},
+                  {"name": "PORT", "value": "3000"}
+                ],
+                "secrets": [
+                  {"name": "NEXTAUTH_SECRET", "valueFrom": "arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:adamguard/nextauth"},
+                  {"name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT_ID }}:secret:adamguard/jwt"}
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/adamguard-prod",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:3000/ || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task-definition.json --region ${{ env.AWS_REGION }}
+
+      - name: Create or Update ECS Service
+        run: |
+          SG_ID="${{ needs.setup-network.outputs.security_group }}"
+          SUBNET_1="${{ needs.setup-network.outputs.subnet_1 }}"
+          SUBNET_2="${{ needs.setup-network.outputs.subnet_2 }}"
+          
+          echo "Security Group: $SG_ID"
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          echo "Target Group: ${{ env.TARGET_GROUP_ARN }}"
+          
+          # Check if service exists and its status
+          SERVICE_INFO=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0]" --output json 2>/dev/null || echo "null")
+          SERVICE_STATUS=$(echo "$SERVICE_INFO" | jq -r '.status // "MISSING"')
+          
+          echo "Service status: $SERVICE_STATUS"
+          
+          if [ "$SERVICE_STATUS" = "DRAINING" ]; then
+            echo "Service is DRAINING, waiting for full deletion..."
+            # Wait up to 10 minutes for service to delete
+            for i in {1..60}; do
+              SERVICE_STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+              echo "Waiting... status: $SERVICE_STATUS (attempt $i/60)"
+              
+              if [ "$SERVICE_STATUS" = "INACTIVE" ] || [ "$SERVICE_STATUS" = "MISSING" ] || [ "$SERVICE_STATUS" = "None" ]; then
+                echo "Service has been deleted"
+                break
+              fi
+              sleep 10
+            done
+            
+            # Force delete if still exists
+            aws ecs delete-service --cluster adamguard-prod --service adamguard-prod-service --force --region ${{ env.AWS_REGION }} 2>/dev/null || true
+            sleep 30
+            SERVICE_STATUS="MISSING"
+          fi
+          
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            echo "Updating existing service..."
+            aws ecs update-service \
+              --cluster adamguard-prod \
+              --service adamguard-prod-service \
+              --task-definition adamguard-prod-task \
+              --force-new-deployment \
+              --region ${{ env.AWS_REGION }}
+          else
+            echo "Creating new service..."
+            aws ecs create-service \
+              --cluster adamguard-prod \
+              --service-name adamguard-prod-service \
+              --task-definition adamguard-prod-task \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --load-balancers targetGroupArn=${{ env.TARGET_GROUP_ARN }},containerName=adamguard-app,containerPort=3000 \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+              --region ${{ env.AWS_REGION }}
+          fi
+
+      - name: Wait for Service Stability
+        run: |
+          echo "Waiting for service stability..."
+          aws ecs wait services-stable --cluster adamguard-prod --services adamguard-prod-service --region ${{ env.AWS_REGION }}
+
+      - name: Output Deployment Info
+        run: |
+          ALB_DNS="${{ needs.setup-network.outputs.alb_dns }}"
+          DOMAIN="${{ github.event.inputs.domain }}"
+          CERT_ARN="${{ needs.setup-network.outputs.certificate_arn }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🚀 DEPLOYMENT SUCCESSFUL!"
+          echo "=========================================="
+          echo ""
+          
+          if [ -n "$DOMAIN" ] && [ -n "$CERT_ARN" ]; then
+            echo "📱 Access your application at:"
+            echo "   https://$DOMAIN"
+            echo ""
+            echo "📋 ALB DNS: $ALB_DNS"
+            echo ""
+            if [ -n "${{ github.event.inputs.hosted_zone_id }}" ]; then
+              echo "DNS Configuration:"
+              echo "  Create A record (alias) pointing to: $ALB_DNS"
+            fi
+          else
+            echo "📱 Access your application at:"
+            echo "   http://$ALB_DNS"
+            echo ""
+            echo "🔒 To enable HTTPS:"
+            echo "   1. Re-run with domain and hosted_zone_id inputs"
+            echo "   2. Or set up custom domain in Route 53"
+          fi
+          
+          echo ""
+          echo "📊 Monitor your application:"
+          echo "   https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/adamguard-prod"
+          echo "=========================================="

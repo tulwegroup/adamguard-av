@@ -1,0 +1,79 @@
+{
+  "appId": "com.adamguard.pro",
+  "appName": "AdamGuard Pro",
+  "webDir": "out",
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "https"
+  },
+  "plugins": {
+    "PushNotifications": {
+      "presentationOptions": ["badge", "sound", "alert"]
+    },
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon_config_sample",
+      "iconColor": "#10B981",
+      "sound": "alert_sound.mp3"
+    },
+    "BiometricAuth": {
+      "iosFaceID": true,
+      "iosTouchID": true,
+      "androidFingerprint": true
+    },
+    "SplashScreen": {
+      "launchShowDuration": 2000,
+      "backgroundColor": "#111827",
+      "androidSplashResourceName": "splash",
+      "androidScaleType": "CENTER_CROP",
+      "showSpinner": false,
+      "splashFullScreen": true,
+      "splashImmersive": true
+    },
+    "StatusBar": {
+      "style": "DARK",
+      "backgroundColor": "#111827"
+    },
+    "Keyboard": {
+      "resize": "body",
+      "resizeOnFullScreen": true
+    },
+    "App": {
+      "backgroundColor": "#111827"
+    },
+    "BackgroundTask": {
+      "enabled": true
+    },
+    "Firebase": {
+      "apiKey": "YOUR_API_KEY",
+      "authDomain": "adamguard-pro.firebaseapp.com",
+      "projectId": "adamguard-pro",
+      "storageBucket": "adamguard-pro.appspot.com",
+      "messagingSenderId": "YOUR_SENDER_ID",
+      "appId": "YOUR_APP_ID"
+    }
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#111827",
+    "buildOptions": {
+      "keystorePath": "keystore.jks",
+      "keystorePassword": "",
+      "keystoreAlias": "adamguard",
+      "keystoreAliasPassword": "",
+      "signingType": "apksigner"
+    },
+    "displayOptions": {
+      "themeColor": "#10B981",
+      "navigationColor": "#111827",
+      "navigationDividerColor": "#374151"
+    }
+  },
+  "ios": {
+    "backgroundColor": "#111827",
+    "contentInset": "automatic",
+    "preferredContentMode": "mobile",
+    "scrollEnabled": true,
+    "allowsLinkPreview": false,
+    "scheme": "adamguard"
+  }
+}

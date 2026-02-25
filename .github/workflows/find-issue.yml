@@ -1,0 +1,197 @@
+# AdamGuard Pro - Find Container Issue
+# Checks stopped tasks and logs to find why container is crashing
+
+name: AdamGuard Find Container Issue
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  find-issue:
+    name: Find Container Issue
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find All Recent Tasks
+        run: |
+          echo "=========================================="
+          echo "🔍 FINDING ALL RECENT TASKS"
+          echo "=========================================="
+          
+          # List all clusters
+          CLUSTERS=$(aws ecs list-clusters --query "clusterArns[?contains(@, 'adamguard')]" --output text)
+          echo "AdamGuard clusters: $CLUSTERS"
+          
+          for cluster_arn in $CLUSTERS; do
+            cluster_name=$(echo $cluster_arn | rev | cut -d'/' -f1 | rev)
+            echo ""
+            echo "=== Cluster: $cluster_name ==="
+            
+            # Get all tasks (running and stopped)
+            echo "Running tasks:"
+            aws ecs list-tasks --cluster $cluster_name --desired-status RUNNING --query "taskArns" --output table 2>/dev/null || echo "None"
+            
+            echo ""
+            echo "Stopped tasks (recent):"
+            aws ecs list-tasks --cluster $cluster_name --desired-status STOPPED --query "taskArns" --output table 2>/dev/null || echo "None"
+          done
+
+      - name: Get Stopped Task Details
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 STOPPED TASK DETAILS"
+          echo "=========================================="
+          
+          CLUSTERS=$(aws ecs list-clusters --query "clusterArns[?contains(@, 'adamguard')]" --output text)
+          
+          for cluster_arn in $CLUSTERS; do
+            cluster_name=$(echo $cluster_arn | rev | cut -d'/' -f1 | rev)
+            
+            STOPPED_TASKS=$(aws ecs list-tasks --cluster $cluster_name --desired-status STOPPED --query "taskArns" --output text 2>/dev/null || echo "")
+            
+            if [ -n "$STOPPED_TASKS" ]; then
+              # Get first stopped task
+              TASK_ARN=$(echo $STOPPED_TASKS | cut -d' ' -f1)
+              
+              echo ""
+              echo "=== Task: $(echo $TASK_ARN | rev | cut -d'/' -f1 | rev) ==="
+              echo "Cluster: $cluster_name"
+              
+              echo ""
+              echo "Task Status:"
+              aws ecs describe-tasks --cluster $cluster_name --tasks $TASK_ARN --query "tasks[0].[lastStatus,stoppedReason,stopCode]" --output table
+              
+              echo ""
+              echo "Container Status:"
+              aws ecs describe-tasks --cluster $cluster_name --tasks $TASK_ARN --query "tasks[0].containers[*].[name,lastStatus,exitCode,reason]" --output table
+              
+              echo ""
+              echo "Full Task Details (JSON):"
+              aws ecs describe-tasks --cluster $cluster_name --tasks $TASK_ARN --output json | jq '.tasks[0] | {lastStatus, stoppedReason, stopCode, containers: [.containers[] | {name, lastStatus, exitCode, reason}]}'
+            fi
+          done
+
+      - name: Get CloudWatch Logs
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 CLOUDWATCH LOGS"
+          echo "=========================================="
+          
+          # List recent log streams
+          echo "Recent log streams:"
+          aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard \
+            --order-by LastEventTime \
+            --descending \
+            --limit 10 \
+            --query "logStreams[*].[logStreamName,lastEventTime]" \
+            --output table 2>/dev/null || echo "No log streams found"
+          
+          # Get logs from most recent stream
+          RECENT_STREAM=$(aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query "logStreams[0].logStreamName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$RECENT_STREAM" ] && [ "$RECENT_STREAM" != "None" ]; then
+            echo ""
+            echo "=== Logs from: $RECENT_STREAM ==="
+            aws logs get-log-events \
+              --log-group-name /ecs/adamguard \
+              --log-stream-name "$RECENT_STREAM" \
+              --limit 100 \
+              --query "events[*].message" \
+              --output text
+          else
+            echo "No log streams found!"
+            echo ""
+            echo "Checking if log group exists..."
+            aws logs describe-log-groups --log-group-name-prefix /ecs/adamguard --query "logGroups[*].[logGroupName,retentionInDays]" --output table
+          fi
+
+      - name: Check Docker Image
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 CHECKING DOCKER IMAGE"
+          echo "=========================================="
+          
+          # Get the latest image details from ECR
+          echo "Latest images in ECR:"
+          aws ecr describe-images --repository-name adamguard-pro --query "sort_by(imageDetails,& imagePushedAt)[-5:].[imageDigest,imagePushedAt,imageSizeInBytes]" --output table 2>/dev/null || echo "No images found or repo doesn't exist"
+          
+          # Check if image exists
+          echo ""
+          echo "Checking image scan findings..."
+          aws ecr describe-image-scan-findings --repository-name adamguard-pro --image-id imageTag=latest --query "imageScanFindings.findingSeverityCounts" --output table 2>/dev/null || echo "No scan findings"
+
+      - name: Check Task Definition
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 LATEST TASK DEFINITION"
+          echo "=========================================="
+          
+          # Get latest task definition
+          LATEST_TD=$(aws ecs list-task-definitions --family-prefix adamguard-task --query "taskDefinitionArns[-1]" --output text)
+          
+          if [ -n "$LATEST_TD" ] && [ "$LATEST_TD" != "None" ]; then
+            echo "Task Definition: $LATEST_TD"
+            echo ""
+            echo "Container Definitions:"
+            aws ecs describe-task-definition --task-definition $LATEST_TD --query "taskDefinition.containerDefinitions[*].[name,image,cpu,memory]" --output table
+            
+            echo ""
+            echo "Environment Variables:"
+            aws ecs describe-task-definition --task-definition $LATEST_TD --query "taskDefinition.containerDefinitions[0].environment" --output table
+            
+            echo ""
+            echo "Full Task Definition:"
+            aws ecs describe-task-definition --task-definition $LATEST_TD --query "taskDefinition.[cpu,memory,networkMode,requiresCompatibilities]" --output table
+          fi
+
+      - name: Summary & Recommendations
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 DIAGNOSIS SUMMARY"
+          echo "=========================================="
+          echo ""
+          echo "COMMON ISSUES & FIXES:"
+          echo ""
+          echo "1. If exitCode=1 and no logs:"
+          echo "   → App is crashing on startup"
+          echo "   → Check Dockerfile and build"
+          echo "   → May need DATABASE_URL or other env vars"
+          echo ""
+          echo "2. If exitCode=137:"
+          echo "   → Out of memory (OOM killed)"
+          echo "   → Increase memory in task definition"
+          echo ""
+          echo "3. If exitCode=139:"
+          echo "   → Segmentation fault"
+          echo "   → Check Node.js compatibility"
+          echo ""
+          echo "4. If 'CannotPullContainerError':"
+          echo "   → ECR image doesn't exist"
+          echo "   → Re-run build step"
+          echo ""
+          echo "5. If no logs at all:"
+          echo "   → Container never started"
+          echo "   → Check image exists in ECR"
+          echo ""

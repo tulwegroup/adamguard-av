@@ -1,0 +1,519 @@
+# AdamGuard Pro - Production Deployment with SSL
+# Sets up: Route 53, SSL Certificate, ALB with HTTPS, ECS
+
+name: AdamGuard Production SSL Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Full domain (e.g., adamguard.deeptech-ai.co.uk)'
+        required: true
+        default: 'adamguard.deeptech-ai.co.uk'
+      hosted_zone_domain:
+        description: 'Main domain (e.g., deeptech-ai.co.uk)'
+        required: true
+        default: 'deeptech-ai.co.uk'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: adamguard-pro
+
+jobs:
+  deploy-production:
+    name: Deploy with SSL
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Build application
+        run: |
+          npm run build
+          ls -la .next/standalone/
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || true
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          provenance: false
+          sbom: false
+
+      - name: Create/Get Route 53 Hosted Zone
+        id: dns
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          MAIN_DOMAIN="${{ github.event.inputs.hosted_zone_domain }}"
+          
+          echo "=========================================="
+          echo "🌐 SETTING UP ROUTE 53"
+          echo "=========================================="
+          echo "Subdomain: $DOMAIN"
+          echo "Main Domain: $MAIN_DOMAIN"
+          
+          # Check if hosted zone exists for main domain
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones --query "HostedZones[?Name=='$MAIN_DOMAIN.'].Id" --output text 2>/dev/null || echo "")
+          
+          if [ -z "$HOSTED_ZONE_ID" ] || [ "$HOSTED_ZONE_ID" = "None" ]; then
+            echo "Creating hosted zone for $MAIN_DOMAIN..."
+            HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
+              --name "$MAIN_DOMAIN" \
+              --caller-reference "$(date +%s)" \
+              --query "HostedZone.Id" \
+              --output text)
+            
+            echo "Getting nameservers..."
+            NAMESERVERS=$(aws route53 get-hosted-zone --id $HOSTED_ZONE_ID --query "DelegationSet.NameServers" --output text)
+            
+            echo ""
+            echo "=========================================="
+            echo "⚠️  IMPORTANT: Update Your Domain's Nameservers"
+            echo "=========================================="
+            echo ""
+            echo "Go to your domain registrar (GoDaddy) and set these nameservers:"
+            echo ""
+            for ns in $NAMESERVERS; do
+              echo "  - $ns"
+            done
+            echo ""
+            echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+          else
+            echo "Hosted zone exists: $HOSTED_ZONE_ID"
+          fi
+          
+          echo "hosted_zone_id=$HOSTED_ZONE_ID" >> $GITHUB_OUTPUT
+
+      - name: Request SSL Certificate
+        id: ssl
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          
+          echo "=========================================="
+          echo "🔒 REQUESTING SSL CERTIFICATE"
+          echo "=========================================="
+          
+          # Check if certificate exists
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" --output text 2>/dev/null | head -1)
+          
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "Requesting new certificate for $DOMAIN..."
+            
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "$DOMAIN" \
+              --validation-method DNS \
+              --subject-alternative-names "*.$DOMAIN" \
+              --query "CertificateArn" \
+              --output text)
+            
+            echo "Certificate requested: $CERT_ARN"
+            sleep 5
+            
+            # Get validation records
+            echo ""
+            echo "Getting DNS validation records..."
+            VALIDATION=$(aws acm describe-certificate \
+              --certificate-arn $CERT_ARN \
+              --query "Certificate.DomainValidationOptions[0]" \
+              --output json)
+            
+            VALIDATION_NAME=$(echo $VALIDATION | jq -r '.ResourceRecord.Name')
+            VALIDATION_VALUE=$(echo $VALIDATION | jq -r '.ResourceRecord.Value')
+            
+            echo ""
+            echo "=========================================="
+            echo "📝 DNS VALIDATION RECORD NEEDED"
+            echo "=========================================="
+            echo ""
+            echo "Add this CNAME record to your Route 53 hosted zone:"
+            echo ""
+            echo "  Type: CNAME"
+            echo "  Name: $VALIDATION_NAME"
+            echo "  Value: $VALIDATION_VALUE"
+            echo ""
+            
+            # Try to add the validation record automatically
+            HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+            
+            if [ -n "$HOSTED_ZONE_ID" ] && [ "$HOSTED_ZONE_ID" != "None" ]; then
+              echo "Adding validation record to Route 53..."
+              
+              cat > /tmp/dns-validation.json << EOF
+          {
+            "Comment": "SSL Certificate Validation",
+            "Changes": [{
+              "Action": "CREATE",
+              "ResourceRecordSet": {
+                "Name": "$VALIDATION_NAME",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "$VALIDATION_VALUE"}]
+              }
+            }]
+          }
+          EOF
+              
+              aws route53 change-resource-record-sets \
+                --hosted-zone-id $HOSTED_ZONE_ID \
+                --change-batch file:///tmp/dns-validation.json || echo "Record may already exist"
+              
+              echo "Validation record added!"
+            fi
+          else
+            echo "Certificate already exists: $CERT_ARN"
+          fi
+          
+          echo "certificate_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+          
+          # Wait for validation (up to 5 minutes)
+          echo ""
+          echo "Waiting for certificate validation..."
+          for i in {1..30}; do
+            STATUS=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.Status" --output text)
+            echo "  Status: $STATUS (attempt $i/30)"
+            
+            if [ "$STATUS" = "ISSUED" ]; then
+              echo "✅ Certificate is ISSUED!"
+              break
+            fi
+            
+            if [ "$STATUS" = "VALIDATION_TIMED_OUT" ] || [ "$STATUS" = "FAILED" ]; then
+              echo "❌ Certificate validation failed"
+              break
+            fi
+            
+            sleep 10
+          done
+
+      - name: Setup Network Infrastructure
+        id: network
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          
+          echo "=========================================="
+          echo "🌐 SETTING UP NETWORK INFRASTRUCTURE"
+          echo "=========================================="
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          echo "VPC: $VPC_ID"
+          
+          # Get subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          
+          # Ensure IGW route exists
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+          
+          if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+            MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[?Main==\`true\`]].RouteTableId" --output text)
+            aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID 2>/dev/null || true
+            echo "IGW route verified"
+          fi
+          
+          # Create security group for ALB
+          ALB_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-alb-ssl-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ALB_SG" = "None" ] || [ -z "$ALB_SG" ]; then
+            echo "Creating ALB security group..."
+            ALB_SG=$(aws ec2 create-security-group \
+              --group-name adamguard-alb-ssl-sg \
+              --description "AdamGuard ALB with SSL" \
+              --vpc-id $VPC_ID \
+              --query "GroupId" \
+              --output text)
+            sleep 3
+          fi
+          
+          # Allow HTTP and HTTPS
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 443 --cidr 0.0.0.0/0 2>/dev/null || true
+          echo "ALB Security Group: $ALB_SG"
+          
+          # Create security group for ECS tasks
+          ECS_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-ecs-ssl-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ECS_SG" = "None" ] || [ -z "$ECS_SG" ]; then
+            echo "Creating ECS security group..."
+            ECS_SG=$(aws ec2 create-security-group \
+              --group-name adamguard-ecs-ssl-sg \
+              --description "AdamGuard ECS Tasks" \
+              --vpc-id $VPC_ID \
+              --query "GroupId" \
+              --output text)
+            sleep 3
+          fi
+          
+          # Allow traffic from ALB
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --source-group $ALB_SG 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --cidr 10.0.0.0/8 2>/dev/null || true
+          echo "ECS Security Group: $ECS_SG"
+          
+          # Create Target Group
+          echo "Creating target group..."
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$TG_ARN" = "None" ] || [ -z "$TG_ARN" ]; then
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-ssl-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --health-check-interval-seconds 30 \
+              --healthy-threshold-count 2 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+          echo "Target Group: $TG_ARN"
+          
+          # Create Application Load Balancer
+          echo "Creating ALB..."
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ALB_ARN" = "None" ] || [ -z "$ALB_ARN" ]; then
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name adamguard-ssl-alb \
+              --subnets $SUBNET_1 $SUBNET_2 \
+              --security-groups $ALB_SG \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text)
+          fi
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+          echo "ALB DNS: $ALB_DNS"
+          echo "ALB ARN: $ALB_ARN"
+          
+          # Create HTTP listener (redirect to HTTPS)
+          HTTP_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Protocol=='HTTP'].ListenerArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$HTTP_LISTENER" = "None" ] || [ -z "$HTTP_LISTENER" ]; then
+            echo "Creating HTTP listener (redirect to HTTPS)..."
+            aws elbv2 create-listener \
+              --load-balancer-arn $ALB_ARN \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions Type=redirect,RedirectConfig='{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}' || true
+          fi
+          
+          # Create HTTPS listener
+          CERT_ARN="${{ steps.ssl.outputs.certificate_arn }}"
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.Status" --output text)
+          
+          HTTPS_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Protocol=='HTTPS'].ListenerArn" --output text 2>/dev/null || echo "None")
+          
+          if { [ "$HTTPS_LISTENER" = "None" ] || [ -z "$HTTPS_LISTENER" ]; } && [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "Creating HTTPS listener..."
+            aws elbv2 create-listener \
+              --load-balancer-arn $ALB_ARN \
+              --protocol HTTPS \
+              --port 443 \
+              --certificates CertificateArn=$CERT_ARN \
+              --default-actions Type=forward,TargetGroupArn=$TG_ARN || true
+          fi
+          
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "subnet_1=$SUBNET_1" >> $GITHUB_OUTPUT
+          echo "subnet_2=$SUBNET_2" >> $GITHUB_OUTPUT
+          echo "ecs_sg=$ECS_SG" >> $GITHUB_OUTPUT
+          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+
+      - name: Setup ECS
+        run: |
+          echo "=========================================="
+          echo "📦 SETTING UP ECS"
+          echo "=========================================="
+          
+          # Create cluster
+          aws ecs create-cluster --cluster-name adamguard-prod --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster exists"
+          
+          # Setup IAM role
+          if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
+            cat > /tmp/trust.json << 'EOF'
+          {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+          EOF
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file:///tmp/trust.json || true
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+            sleep 10
+          fi
+          
+          # Create log group
+          aws logs create-log-group --log-group-name /ecs/adamguard-prod --region ${{ env.AWS_REGION }} 2>/dev/null || true
+
+      - name: Deploy ECS Service
+        run: |
+          TG_ARN="${{ steps.network.outputs.tg_arn }}"
+          SUBNET_1="${{ steps.network.outputs.subnet_1 }}"
+          SUBNET_2="${{ steps.network.outputs.subnet_2 }}"
+          ECS_SG="${{ steps.network.outputs.ecs_sg }}"
+          
+          echo "Target Group: $TG_ARN"
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          echo "Security Group: $ECS_SG"
+          
+          # Register task definition
+          cat > /tmp/task.json << EOF
+          {
+            "family": "adamguard-prod-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "adamguard-app",
+              "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard-prod",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task.json --region ${{ env.AWS_REGION }}
+          
+          # Create or update service
+          SERVICE_STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            echo "Updating existing service..."
+            aws ecs update-service \
+              --cluster adamguard-prod \
+              --service adamguard-prod-service \
+              --task-definition adamguard-prod-task \
+              --force-new-deployment \
+              --region ${{ env.AWS_REGION }}
+          else
+            echo "Creating new service..."
+            aws ecs create-service \
+              --cluster adamguard-prod \
+              --service-name adamguard-prod-service \
+              --task-definition adamguard-prod-task \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --load-balancers targetGroupArn=$TG_ARN,containerName=adamguard-app,containerPort=3000 \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+              --region ${{ env.AWS_REGION }}
+          fi
+          
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable --cluster adamguard-prod --services adamguard-prod-service --region ${{ env.AWS_REGION }} || true
+
+      - name: Configure Route 53 DNS
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          ALB_DNS="${{ steps.network.outputs.alb_dns }}"
+          HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+          
+          echo "=========================================="
+          echo "🌐 CONFIGURING DNS"
+          echo "=========================================="
+          
+          # Get ALB hosted zone for alias
+          ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --load-balancer-arns ${{ steps.network.outputs.alb_arn }} --query "LoadBalancers[0].CanonicalHostedZoneId" --output text)
+          
+          echo "Creating A record (alias) for $DOMAIN -> $ALB_DNS"
+          
+          cat > /tmp/dns-record.json << EOF
+          {
+            "Comment": "AdamGuard production subdomain",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$DOMAIN.",
+                "Type": "A",
+                "AliasTarget": {
+                  "HostedZoneId": "$ALB_ZONE_ID",
+                  "DNSName": "dualstack.$ALB_DNS",
+                  "EvaluateTargetHealth": true
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --change-batch file:///tmp/dns-record.json || echo "DNS record may need manual setup"
+          
+          echo "DNS record created!"
+
+      - name: Output Results
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          ALB_DNS="${{ steps.network.outputs.alb_dns }}"
+          CERT_ARN="${{ steps.ssl.outputs.certificate_arn }}"
+          HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+          
+          # Check certificate status
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.Status" --output text 2>/dev/null || echo "UNKNOWN")
+          
+          echo ""
+          echo "=========================================="
+          echo "🚀 DEPLOYMENT COMPLETE!"
+          echo "=========================================="
+          echo ""
+          echo "📱 Domain: https://$DOMAIN"
+          echo ""
+          echo "📋 Details:"
+          echo "   - ALB DNS: $ALB_DNS"
+          echo "   - Certificate: $CERT_ARN"
+          echo "   - Certificate Status: $CERT_STATUS"
+          echo "   - Hosted Zone ID: $HOSTED_ZONE_ID"
+          echo ""
+          
+          if [ "$CERT_STATUS" != "ISSUED" ]; then
+            echo "⚠️  SSL Certificate is pending validation."
+            echo "   Please add the DNS validation record to your hosted zone."
+            echo ""
+            echo "   Once validated, run this workflow again to complete setup."
+          fi
+          
+          echo "=========================================="

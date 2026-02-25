@@ -1,0 +1,359 @@
+# AdamGuard Pro - Ultimate Network Fix
+# Identifies TRUE public subnets and fixes all networking
+
+name: AdamGuard Ultimate Network Fix
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  ultimate-fix:
+    name: Ultimate Network Fix
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Info
+        run: |
+          echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Diagnose and Fix Everything
+        id: fix
+        run: |
+          set -e
+          
+          echo "=========================================="
+          echo "🔍 ULTIMATE NETWORK DIAGNOSIS & FIX"
+          echo "=========================================="
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          echo "VPC: $VPC_ID"
+          
+          # ============================================
+          # CRITICAL: Find TRUE public subnets
+          # ============================================
+          echo ""
+          echo "1. Finding TRUE public subnets (with IGW route)..."
+          
+          # Get Internet Gateway for this VPC
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+          echo "Internet Gateway: $IGW_ID"
+          
+          if [ "$IGW_ID" = "None" ] || [ -z "$IGW_ID" ]; then
+            echo "⚠️ No Internet Gateway found! Creating one..."
+            IGW_ID=$(aws ec2 create-internet-gateway --query "InternetGateway.InternetGatewayId" --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+            echo "Created and attached IGW: $IGW_ID"
+          fi
+          
+          # Get all subnets
+          ALL_SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          echo "All subnets: $ALL_SUBNETS"
+          
+          # Find subnets with route to IGW
+          PUBLIC_SUBNETS=""
+          for subnet in $ALL_SUBNETS; do
+            ROUTE_TABLE=$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$subnet" --query "RouteTables[0].Routes[?GatewayId=='$IGW_ID'].GatewayId" --output text 2>/dev/null || echo "")
+            
+            # Also check main route table
+            if [ -z "$ROUTE_TABLE" ] || [ "$ROUTE_TABLE" = "None" ]; then
+              MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" "Name=isDefault,Values=true" --query "RouteTables[0].Routes[?GatewayId=='$IGW_ID'].GatewayId" --output text 2>/dev/null || echo "")
+              if [ -n "$MAIN_RT" ] && [ "$MAIN_RT" != "None" ]; then
+                ROUTE_TABLE=$MAIN_RT
+              fi
+            fi
+            
+            if [ -n "$ROUTE_TABLE" ] && [ "$ROUTE_TABLE" != "None" ]; then
+              echo "✅ $subnet has route to IGW (PUBLIC)"
+              PUBLIC_SUBNETS="$PUBLIC_SUBNETS $subnet"
+            else
+              echo "❌ $subnet has NO route to IGW (PRIVATE)"
+            fi
+          done
+          
+          # If no public subnets, make all default subnets public
+          if [ -z "$PUBLIC_SUBNETS" ]; then
+            echo ""
+            echo "⚠️ No public subnets found! Creating routes to IGW..."
+            
+            MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" "Name=isDefault,Values=true" --query "RouteTables[0].RouteTableId" --output text)
+            echo "Main Route Table: $MAIN_RT"
+            
+            # Add route to IGW
+            aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID 2>/dev/null || true
+            
+            # Now all subnets using main route table are public
+            PUBLIC_SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+            echo "Now all subnets are public: $PUBLIC_SUBNETS"
+          fi
+          
+          # Get first two public subnets
+          SUBNET_ARRAY=($PUBLIC_SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          
+          echo ""
+          echo "Using public subnets: $SUBNET_1, $SUBNET_2"
+          
+          # ============================================
+          # Create Security Groups
+          # ============================================
+          echo ""
+          echo "2. Creating Security Groups..."
+          
+          # ALB Security Group (allows all inbound)
+          ALB_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-alb-public" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ALB_SG" = "None" ] || [ -z "$ALB_SG" ]; then
+            ALB_SG=$(aws ec2 create-security-group --group-name adamguard-alb-public --description "AdamGuard ALB Public" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 2
+          fi
+          
+          # Allow all inbound
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --ip-permissions "IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]" 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --ip-permissions "IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}]" 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --ip-permissions "IpProtocol=tcp,FromPort=3000,ToPort=3000,IpRanges=[{CidrIp=0.0.0.0/0}]" 2>/dev/null || true
+          
+          echo "ALB SG: $ALB_SG"
+          
+          # ECS Tasks Security Group
+          ECS_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-ecs-public" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ECS_SG" = "None" ] || [ -z "$ECS_SG" ]; then
+            ECS_SG=$(aws ec2 create-security-group --group-name adamguard-ecs-public --description "AdamGuard ECS Public" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 2
+          fi
+          
+          # Allow all inbound on port 3000
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --ip-permissions "IpProtocol=tcp,FromPort=3000,ToPort=3000,IpRanges=[{CidrIp=0.0.0.0/0}]" 2>/dev/null || true
+          
+          echo "ECS SG: $ECS_SG"
+          
+          # ============================================
+          # Delete old ALB and create new one
+          # ============================================
+          echo ""
+          echo "3. Recreating Load Balancer..."
+          
+          # Delete old ALB if exists
+          OLD_ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$OLD_ALB_ARN" != "None" ] && [ -n "$OLD_ALB_ARN" ]; then
+            echo "Deleting old ALB..."
+            aws elbv2 delete-load-balancer --load-balancer-arn $OLD_ALB_ARN 2>/dev/null || true
+            sleep 20
+          fi
+          
+          # Delete old target group
+          OLD_TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$OLD_TG_ARN" != "None" ] && [ -n "$OLD_TG_ARN" ]; then
+            echo "Deleting old target group..."
+            aws elbv2 delete-target-group --target-group-arn $OLD_TG_ARN 2>/dev/null || true
+            sleep 5
+          fi
+          
+          # Create new ALB in PUBLIC subnets
+          echo "Creating new ALB in public subnets..."
+          ALB_ARN=$(aws elbv2 create-load-balancer \
+            --name adamguard-alb \
+            --subnets $SUBNET_1 $SUBNET_2 \
+            --security-groups $ALB_SG \
+            --scheme internet-facing \
+            --type application \
+            --ip-address-type ipv4 \
+            --query "LoadBalancers[0].LoadBalancerArn" \
+            --output text)
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+          echo "New ALB DNS: $ALB_DNS"
+          
+          # Create new target group
+          echo "Creating new target group..."
+          TG_ARN=$(aws elbv2 create-target-group \
+            --name adamguard-tg \
+            --protocol HTTP \
+            --port 3000 \
+            --vpc-id $VPC_ID \
+            --target-type ip \
+            --health-check-path "/" \
+            --health-check-interval-seconds 15 \
+            --health-check-timeout-seconds 10 \
+            --healthy-threshold-count 2 \
+            --unhealthy-threshold-count 3 \
+            --matcher HttpCode=200-499 \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+          
+          echo "Target Group: $TG_ARN"
+          
+          # Create listener
+          echo "Creating listener..."
+          aws elbv2 create-listener \
+            --load-balancer-arn $ALB_ARN \
+            --protocol HTTP \
+            --port 80 \
+            --default-actions Type=forward,TargetGroupArn=$TG_ARN
+          
+          # ============================================
+          # Recreate ECS Service
+          # ============================================
+          echo ""
+          echo "4. Recreating ECS Service..."
+          
+          # Delete old service with proper wait
+          SERVICE_STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          if [ "$SERVICE_STATUS" != "MISSING" ] && [ "$SERVICE_STATUS" != "None" ]; then
+            echo "Service status: $SERVICE_STATUS"
+            
+            # If DRAINING, wait for it to complete
+            if [ "$SERVICE_STATUS" = "DRAINING" ]; then
+              echo "Service is DRAINING, waiting for full deletion..."
+              for i in {1..40}; do
+                STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+                echo "  Waiting... status=$STATUS (attempt $i/40)"
+                
+                if [ "$STATUS" = "INACTIVE" ] || [ "$STATUS" = "MISSING" ] || [ "$STATUS" = "None" ] || [ -z "$STATUS" ]; then
+                  echo "  Service fully deleted!"
+                  break
+                fi
+                sleep 15
+              done
+            else
+              echo "Setting desired count to 0..."
+              aws ecs update-service --cluster adamguard-prod --service adamguard-prod-service --desired-count 0 2>/dev/null || true
+              sleep 30
+              
+              echo "Deleting service..."
+              aws ecs delete-service --cluster adamguard-prod --service adamguard-prod-service --force 2>/dev/null || true
+              
+              echo "Waiting for service deletion..."
+              for i in {1..30}; do
+                STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+                echo "  Waiting... status=$STATUS (attempt $i/30)"
+                
+                if [ "$STATUS" = "INACTIVE" ] || [ "$STATUS" = "MISSING" ] || [ "$STATUS" = "None" ] || [ -z "$STATUS" ]; then
+                  echo "  Service fully deleted!"
+                  break
+                fi
+                sleep 15
+              done
+            fi
+          fi
+          
+          # Double-check service is gone
+          FINAL_CHECK=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          if [ "$FINAL_CHECK" != "INACTIVE" ] && [ "$FINAL_CHECK" != "MISSING" ] && [ "$FINAL_CHECK" != "None" ]; then
+            echo "Force deleting stubborn service..."
+            aws ecs delete-service --cluster adamguard-prod --service adamguard-prod-service --force 2>/dev/null || true
+            sleep 60
+          fi
+          
+          echo "Service deletion complete. Proceeding with creation..."
+          
+          # Register task definition
+          echo "Registering task definition..."
+          
+          cat > /tmp/task-def.json << EOF
+          {
+            "family": "adamguard-prod-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "adamguard-app",
+              "image": "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/adamguard-pro:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard-prod",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region ${{ env.AWS_REGION }}
+          
+          # Create new service with PUBLIC IP assignment
+          echo "Creating new service with public IP..."
+          aws ecs create-service \
+            --cluster adamguard-prod \
+            --service-name adamguard-prod-service \
+            --task-definition adamguard-prod-task \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --load-balancers targetGroupArn=$TG_ARN,containerName=adamguard-app,containerPort=3000 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "=========================================="
+          echo "✅ FIX COMPLETE!"
+          echo "=========================================="
+          echo ""
+          echo "📱 URL: http://$ALB_DNS"
+
+      - name: Wait for Deployment
+        run: |
+          echo "Waiting 3 minutes for service to start..."
+          sleep 180
+
+      - name: Verify Targets
+        run: |
+          TG_ARN="${{ steps.fix.outputs.tg_arn }}"
+          
+          echo "Checking target health..."
+          aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table || true
+          
+          echo ""
+          echo "Checking running tasks..."
+          TASKS=$(aws ecs list-tasks --cluster adamguard-prod --service adamguard-prod-service --query "taskArns" --output text)
+          
+          if [ -n "$TASKS" ]; then
+            echo "Tasks found: $TASKS"
+            aws ecs describe-tasks --cluster adamguard-prod --tasks $TASKS --query "tasks[*].[lastStatus,healthStatus]" --output table || true
+          else
+            echo "No tasks running yet"
+          fi
+
+      - name: Final URL
+        run: |
+          ALB_DNS="${{ steps.fix.outputs.alb_dns }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🚀 YOUR APPLICATION URL"
+          echo "=========================================="
+          echo ""
+          echo "📱 http://$ALB_DNS"
+          echo ""
+          echo "If still not working, check:"
+          echo "1. ECS Tasks: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/adamguard-prod/services/adamguard-prod-service/tasks"
+          echo "2. ALB: https://console.aws.amazon.com/ec2/v2/home?region=${{ env.AWS_REGION }}#LoadBalancers:search=adamguard-alb"
+          echo "3. Logs: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/\$252Fecs\$252Fadamguard-prod"

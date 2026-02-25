@@ -1,0 +1,331 @@
+# AdamGuard Pro - Simple Direct Access Deployment
+# No ALB - Direct access to ECS task via public IP
+
+name: AdamGuard Simple Deploy
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: adamguard-pro
+
+jobs:
+  deploy:
+    name: Deploy AdamGuard
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build application
+        run: bun run build
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          NEXTAUTH_SECRET: test-secret
+          JWT_SECRET: test-jwt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || true
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          provenance: false
+          sbom: false
+
+      - name: Create ECS Cluster
+        run: |
+          aws ecs create-cluster --cluster-name adamguard-cluster --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster exists"
+
+      - name: Setup IAM Role
+        run: |
+          if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
+            cat > /tmp/trust-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+              "Action": "sts:AssumeRole"
+            }]
+          }
+          EOF
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file:///tmp/trust-policy.json || true
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          fi
+          
+          # Add Secrets Manager access
+          cat > /tmp/secrets-policy.json << 'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+              "Resource": ["arn:aws:secretsmanager:*:*:secret:adamguard/*"]
+            }]
+          }
+          EOF
+          aws iam put-role-policy --role-name ecsTaskExecutionRole --policy-name SecretsAccess --policy-document file:///tmp/secrets-policy.json 2>/dev/null || true
+          
+          sleep 10
+
+      - name: Create AWS Secrets
+        run: |
+          # Create secrets if they don't exist
+          if ! aws secretsmanager describe-secret --secret-id adamguard/nextauth --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            aws secretsmanager create-secret \
+              --name adamguard/nextauth \
+              --secret-string "$(openssl rand -base64 48)" \
+              --region ${{ env.AWS_REGION }} || true
+          fi
+          
+          if ! aws secretsmanager describe-secret --secret-id adamguard/jwt --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            aws secretsmanager create-secret \
+              --name adamguard/jwt \
+              --secret-string "$(openssl rand -base64 48)" \
+              --region ${{ env.AWS_REGION }} || true
+          fi
+
+      - name: Setup Network Resources
+        id: network
+        run: |
+          set -e
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          echo "VPC: $VPC_ID"
+          
+          # Get or create Internet Gateway
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+          
+          if [ "$IGW_ID" = "None" ] || [ -z "$IGW_ID" ]; then
+            echo "Creating Internet Gateway..."
+            IGW_ID=$(aws ec2 create-internet-gateway --query "InternetGateway.InternetGatewayId" --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+          fi
+          echo "IGW: $IGW_ID"
+          
+          # Ensure main route table has route to IGW
+          MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[?Main==\`true\`]].RouteTableId" --output text)
+          echo "Main Route Table: $MAIN_RT"
+          
+          # Add route to IGW if not exists
+          aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID 2>/dev/null || echo "Route exists"
+          
+          # Get subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          
+          # Create security group allowing port 3000
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            echo "Creating security group..."
+            SG_ID=$(aws ec2 create-security-group --group-name adamguard-sg --description "AdamGuard Security Group" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 5
+          fi
+          
+          # Add inbound rules
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0 2>/dev/null || true
+          
+          echo "Security Group: $SG_ID"
+          
+          # Output values
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "subnet_1=$SUBNET_1" >> $GITHUB_OUTPUT
+          echo "subnet_2=$SUBNET_2" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create CloudWatch Log Group
+        run: |
+          aws logs create-log-group --log-group-name /ecs/adamguard --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Log group exists"
+
+      - name: Register Task Definition
+        run: |
+          cat > /tmp/task-def.json << EOF
+          {
+            "family": "adamguard-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "adamguard-app",
+              "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region ${{ env.AWS_REGION }}
+
+      - name: Delete Existing Service
+        run: |
+          STATUS=$(aws ecs describe-services --cluster adamguard-cluster --services adamguard-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          echo "Current service status: $STATUS"
+          
+          if [ "$STATUS" != "MISSING" ] && [ "$STATUS" != "None" ] && [ -n "$STATUS" ]; then
+            echo "Service exists, waiting for full deletion..."
+            
+            # If DRAINING, wait for it to complete
+            if [ "$STATUS" = "DRAINING" ]; then
+              echo "Service is DRAINING, waiting..."
+              for i in {1..60}; do
+                S=$(aws ecs describe-services --cluster adamguard-cluster --services adamguard-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+                echo "  Attempt $i/60: status=$S"
+                if [ "$S" = "INACTIVE" ] || [ "$S" = "MISSING" ] || [ "$S" = "None" ] || [ -z "$S" ]; then
+                  echo "  Service fully deleted!"
+                  break
+                fi
+                sleep 10
+              done
+            else
+              # Scale down and delete
+              echo "Scaling down to 0..."
+              aws ecs update-service --cluster adamguard-cluster --service adamguard-service --desired-count 0 --region ${{ env.AWS_REGION }} || true
+              sleep 30
+              
+              echo "Deleting service..."
+              aws ecs delete-service --cluster adamguard-cluster --service adamguard-service --force --region ${{ env.AWS_REGION }} || true
+              
+              echo "Waiting for deletion..."
+              for i in {1..60}; do
+                S=$(aws ecs describe-services --cluster adamguard-cluster --services adamguard-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+                echo "  Attempt $i/60: status=$S"
+                if [ "$S" = "INACTIVE" ] || [ "$S" = "MISSING" ] || [ "$S" = "None" ] || [ -z "$S" ]; then
+                  echo "  Service fully deleted!"
+                  break
+                fi
+                sleep 10
+              done
+            fi
+          fi
+          
+          # Final check
+          FINAL=$(aws ecs describe-services --cluster adamguard-cluster --services adamguard-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          echo "Final status: $FINAL"
+          
+          if [ "$FINAL" != "INACTIVE" ] && [ "$FINAL" != "MISSING" ] && [ "$FINAL" != "None" ] && [ -n "$FINAL" ]; then
+            echo "Force deleting stubborn service..."
+            aws ecs delete-service --cluster adamguard-cluster --service adamguard-service --force --region ${{ env.AWS_REGION }} || true
+            sleep 60
+          fi
+          
+          echo "Ready to create new service!"
+
+      - name: Create ECS Service
+        run: |
+          SG_ID="${{ steps.network.outputs.sg_id }}"
+          SUBNET_1="${{ steps.network.outputs.subnet_1 }}"
+          SUBNET_2="${{ steps.network.outputs.subnet_2 }}"
+          
+          echo "Creating ECS Service..."
+          echo "  Subnets: $SUBNET_1, $SUBNET_2"
+          echo "  Security Group: $SG_ID"
+          
+          aws ecs create-service \
+            --cluster adamguard-cluster \
+            --service-name adamguard-service \
+            --task-definition adamguard-task \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for Service
+        run: |
+          echo "Waiting for service to start..."
+          aws ecs wait services-stable --cluster adamguard-cluster --services adamguard-service --region ${{ env.AWS_REGION }} || true
+
+      - name: Get Application URL
+        run: |
+          echo "Getting task public IP..."
+          
+          TASK_ARN=$(aws ecs list-tasks --cluster adamguard-cluster --service-name adamguard-service --query "taskArns[0]" --output text --region ${{ env.AWS_REGION }})
+          
+          if [ "$TASK_ARN" != "None" ] && [ -n "$TASK_ARN" ]; then
+            echo "Task ARN: $TASK_ARN"
+            
+            # Get ENI
+            ENI_ID=$(aws ecs describe-tasks --cluster adamguard-cluster --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text --region ${{ env.AWS_REGION }})
+            echo "ENI: $ENI_ID"
+            
+            if [ "$ENI_ID" != "None" ] && [ -n "$ENI_ID" ]; then
+              PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text --region ${{ env.AWS_REGION }})
+              
+              echo ""
+              echo "=========================================="
+              echo "🚀 DEPLOYMENT SUCCESSFUL!"
+              echo "=========================================="
+              echo ""
+              echo "📱 Access your application at:"
+              echo "   http://$PUBLIC_IP:3000"
+              echo ""
+              echo "=========================================="
+            else
+              echo "No ENI found, check AWS console"
+            fi
+          else
+            echo "No task running, check AWS console"
+          fi

@@ -1,0 +1,230 @@
+# AdamGuard Pro - Check Stopped Tasks
+# Finds why tasks are stopping
+
+name: AdamGuard Check Stopped Tasks
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  check-stopped:
+    name: Check Stopped Tasks & Logs
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find All Tasks
+        run: |
+          echo "=========================================="
+          echo "🔍 FINDING ALL TASKS (Running & Stopped)"
+          echo "=========================================="
+          
+          # Get all clusters
+          CLUSTERS=$(aws ecs list-clusters --query "clusterArns[?contains(@, 'adamguard')]" --output text)
+          
+          for cluster_arn in $CLUSTERS; do
+            cluster_name=$(echo $cluster_arn | rev | cut -d'/' -f1 | rev)
+            echo ""
+            echo "=== Cluster: $cluster_name ==="
+            
+            # Running tasks
+            echo "Running tasks:"
+            aws ecs list-tasks --cluster $cluster_name --desired-status RUNNING --query "taskArns" --output table
+            
+            # Stopped tasks
+            echo ""
+            echo "Stopped tasks (last 5):"
+            STOPPED=$(aws ecs list-tasks --cluster $cluster_name --desired-status STOPPED --query "taskArns[:5]" --output text)
+            echo "$STOPPED"
+            
+            if [ -n "$STOPPED" ]; then
+              echo ""
+              echo "Stopped task details:"
+              aws ecs describe-tasks --cluster $cluster_name --tasks $STOPPED --query "tasks[*].[taskArn,lastStatus,stoppedReason,containers[0].exitCode,containers[0].reason]" --output table
+            fi
+          done
+
+      - name: Get Recent Logs
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 RECENT APPLICATION LOGS"
+          echo "=========================================="
+          
+          # Get recent log streams
+          echo "Recent log streams:"
+          aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard \
+            --order-by LastEventTime \
+            --descending \
+            --limit 10 \
+            --query "logStreams[*].[logStreamName,lastEventTime]" \
+            --output table 2>/dev/null || echo "No log streams found"
+          
+          # Get latest logs
+          echo ""
+          echo "Latest logs:"
+          LATEST_STREAM=$(aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query "logStreams[0].logStreamName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$LATEST_STREAM" ] && [ "$LATEST_STREAM" != "None" ]; then
+            echo "Stream: $LATEST_STREAM"
+            echo ""
+            aws logs get-log-events \
+              --log-group-name /ecs/adamguard \
+              --log-stream-name "$LATEST_STREAM" \
+              --limit 100 \
+              --query "events[*].message" \
+              --output text 2>/dev/null || echo "Could not read logs"
+          fi
+
+      - name: Check Docker Image
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 CHECKING DOCKER IMAGE"
+          echo "=========================================="
+          
+          # Get latest image details
+          aws ecr describe-images \
+            --repository-name adamguard-pro \
+            --query "sort_by(imageDetails,& imagePushedAt)[-1].[imagePushedAt,imageSizeInBytes]" \
+            --output table 2>/dev/null || echo "No images found"
+          
+          # Check if image exists
+          IMAGE_COUNT=$(aws ecr describe-images --repository-name adamguard-pro --query "length(imageDetails)" --output text 2>/dev/null || echo "0")
+          echo "Images in ECR: $IMAGE_COUNT"
+
+      - name: Check Task Definition
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 LATEST TASK DEFINITION"
+          echo "=========================================="
+          
+          aws ecs describe-task-definition \
+            --task-definition adamguard-task \
+            --query "taskDefinition.[family,revision,cpu,memory,networkMode]" \
+            --output table
+          
+          echo ""
+          echo "Container definitions:"
+          aws ecs describe-task-definition \
+            --task-definition adamguard-task \
+            --query "taskDefinition.containerDefinitions[*].[name,image,cpu,memory]" \
+            --output table
+
+      - name: Manual Run Task with Debug
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🚀 RUNNING NEW TASK WITH DEBUG"
+          echo "=========================================="
+          
+          # Get VPC info
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          
+          # Get subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          
+          # Get security group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-public-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          fi
+          
+          if [ "$SG_ID" = "None" ]; then
+            echo "Creating security group..."
+            SG_ID=$(aws ec2 create-security-group --group-name adamguard-debug-sg --description "AdamGuard Debug" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 3
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 2>/dev/null || true
+          fi
+          
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          echo "Security Group: $SG_ID"
+          
+          # Find a cluster
+          CLUSTER=$(aws ecs list-clusters --query "clusterArns[?contains(@, 'adamguard')]" --output text | cut -d' ' -f1 | rev | cut -d'/' -f1 | rev)
+          
+          if [ -z "$CLUSTER" ]; then
+            echo "Creating cluster..."
+            CLUSTER="adamguard-debug"
+            aws ecs create-cluster --cluster-name $CLUSTER
+          fi
+          
+          echo "Cluster: $CLUSTER"
+          
+          # Run task
+          echo ""
+          echo "Running task..."
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition adamguard-task \
+            --launch-type FARGATE \
+            --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text)
+          
+          echo "Task ARN: $TASK_ARN"
+          
+          # Wait and check
+          echo ""
+          echo "Waiting 60 seconds for task to start..."
+          sleep 60
+          
+          echo ""
+          echo "Task status:"
+          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].[lastStatus,healthStatus]" --output table
+          
+          # If running, get IP
+          STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].lastStatus" --output text)
+          
+          if [ "$STATUS" = "RUNNING" ]; then
+            ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+            
+            if [ -n "$ENI_ID" ] && [ "$ENI_ID" != "None" ]; then
+              PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+              
+              echo ""
+              echo "=========================================="
+              echo "✅ TASK RUNNING!"
+              echo "=========================================="
+              echo ""
+              echo "📱 Access at: http://$PUBLIC_IP:3000"
+              echo ""
+            fi
+          else
+            echo ""
+            echo "Task not running. Checking logs..."
+            sleep 30
+            
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].[lastStatus,stoppedReason,containers[0].exitCode,containers[0].reason]" --output table
+            
+            # Check latest logs
+            echo ""
+            echo "Latest logs:"
+            LATEST_STREAM=$(aws logs describe-log-streams --log-group-name /ecs/adamguard --order-by LastEventTime --descending --limit 1 --query "logStreams[0].logStreamName" --output text 2>/dev/null)
+            
+            if [ -n "$LATEST_STREAM" ]; then
+              aws logs get-log-events --log-group-name /ecs/adamguard --log-stream-name "$LATEST_STREAM" --limit 50 --query "events[*].message" --output text
+            fi
+          fi

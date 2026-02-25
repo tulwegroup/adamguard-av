@@ -1,0 +1,314 @@
+# AdamGuard - DNS & SSL Fix
+# Diagnoses and fixes DNS/SSL issues
+
+name: AdamGuard DNS SSL Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Full domain'
+        required: true
+        default: 'adamguard.deeptech-ai.co.uk'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  diagnose-fix:
+    name: Diagnose & Fix DNS/SSL
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check Route 53 Configuration
+        id: dns
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          MAIN_DOMAIN=$(echo $DOMAIN | cut -d'.' -f2-)
+          
+          echo "=========================================="
+          echo "🔍 ROUTE 53 DIAGNOSTIC"
+          echo "=========================================="
+          echo "Domain: $DOMAIN"
+          echo "Main Domain: $MAIN_DOMAIN"
+          echo ""
+          
+          # Get hosted zone
+          echo "1. Checking Hosted Zone..."
+          HOSTED_ZONE=$(aws route53 list-hosted-zones --query "HostedZones[?contains(Name, '$MAIN_DOMAIN')]" --output json)
+          echo "$HOSTED_ZONE"
+          
+          HOSTED_ZONE_ID=$(echo "$HOSTED_ZONE" | jq -r '.[0].Id // empty')
+          
+          if [ -z "$HOSTED_ZONE_ID" ]; then
+            echo "❌ No hosted zone found for $MAIN_DOMAIN"
+            echo "Creating hosted zone..."
+            HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
+              --name "$MAIN_DOMAIN" \
+              --caller-reference "$(date +%s)" \
+              --query "HostedZone.Id" \
+              --output text)
+            echo "Created: $HOSTED_ZONE_ID"
+          fi
+          
+          # Clean up the ID
+          HOSTED_ZONE_ID=$(echo $HOSTED_ZONE_ID | rev | cut -d'/' -f1 | rev)
+          echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+          
+          # Get nameservers
+          echo ""
+          echo "2. Nameservers for this Hosted Zone:"
+          NAMESERVERS=$(aws route53 get-hosted-zone --id $HOSTED_ZONE_ID --query "DelegationSet.NameServers" --output json)
+          echo "$NAMESERVERS"
+          
+          echo ""
+          echo "=========================================="
+          echo "⚠️  ACTION REQUIRED IN GODADDY"
+          echo "=========================================="
+          echo ""
+          echo "Go to GoDaddy DNS settings and set these nameservers:"
+          echo ""
+          echo "$NAMESERVERS" | jq -r '.[]' | while read ns; do
+            echo "  📝 $ns"
+          done
+          echo ""
+          echo "Note: DNS propagation can take 24-48 hours (usually 1-2 hours)"
+          
+          echo "hosted_zone_id=$HOSTED_ZONE_ID" >> $GITHUB_OUTPUT
+          echo "nameservers=$NAMESERVERS" >> $GITHUB_OUTPUT
+
+      - name: Check Existing DNS Records
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 EXISTING DNS RECORDS"
+          echo "=========================================="
+          
+          aws route53 list-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --query "ResourceRecordSets[?Name=='$DOMAIN.' || Name=='*.$DOMAIN.' || Type=='NS' || Type=='SOA']" \
+            --output table
+
+      - name: Check SSL Certificate
+        id: ssl
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 SSL CERTIFICATE STATUS"
+          echo "=========================================="
+          
+          # Find certificate
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" --output text | head -1)
+          
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "❌ No certificate found"
+            exit 0
+          fi
+          
+          echo "Certificate ARN: $CERT_ARN"
+          
+          # Get certificate details
+          aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.[Status,Type]" --output table
+          
+          # Get validation options
+          echo ""
+          echo "Validation Options:"
+          aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.DomainValidationOptions" --output json > /tmp/validation.json
+          cat /tmp/validation.json
+          
+          # Check if we have validation records
+          VALIDATION_NAME=$(cat /tmp/validation.json | jq -r '.[0].ResourceRecord.Name // empty')
+          VALIDATION_VALUE=$(cat /tmp/validation.json | jq -r '.[0].ResourceRecord.Value // empty')
+          
+          echo ""
+          echo "Validation Record Needed:"
+          echo "  Name: $VALIDATION_NAME"
+          echo "  Value: $VALIDATION_VALUE"
+          
+          echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+          echo "validation_name=$VALIDATION_NAME" >> $GITHUB_OUTPUT
+          echo "validation_value=$VALIDATION_VALUE" >> $GITHUB_OUTPUT
+
+      - name: Add DNS Validation Record
+        run: |
+          HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+          VALIDATION_NAME="${{ steps.ssl.outputs.validation_name }}"
+          VALIDATION_VALUE="${{ steps.ssl.outputs.validation_value }}"
+          
+          if [ -z "$VALIDATION_NAME" ] || [ "$VALIDATION_NAME" = "null" ]; then
+            echo "No validation record needed or available"
+            exit 0
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🔧 ADDING DNS VALIDATION RECORD"
+          echo "=========================================="
+          
+          # Remove trailing dot from name for the record
+          RECORD_NAME="$VALIDATION_NAME"
+          
+          cat > /tmp/validation-record.json << EOF
+          {
+            "Comment": "SSL Certificate Validation",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$RECORD_NAME",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "$VALIDATION_VALUE"}]
+              }
+            }]
+          }
+          EOF
+          
+          echo "Adding record:"
+          cat /tmp/validation-record.json
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --change-batch file:///tmp/validation-record.json
+          
+          echo "✅ Validation record added!"
+
+      - name: Add A Record for Subdomain
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          HOSTED_ZONE_ID="${{ steps.dns.outputs.hosted_zone_id }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔧 ADDING/MODIFYING A RECORD"
+          echo "=========================================="
+          
+          # Get ALB details
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$ALB_ARN" = "None" ]; then
+            echo "❌ ALB not found! Checking for any ALB..."
+            ALB_DNS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "None")
+            
+            if [ "$ALB_DNS" = "None" ]; then
+              echo "❌ No ALB found at all!"
+              exit 1
+            fi
+          else
+            ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+            ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].CanonicalHostedZoneId" --output text)
+          fi
+          
+          echo "ALB DNS: $ALB_DNS"
+          echo "ALB Zone ID: $ALB_ZONE_ID"
+          
+          # Create A record (alias)
+          cat > /tmp/a-record.json << EOF
+          {
+            "Comment": "AdamGuard subdomain A record",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$DOMAIN.",
+                "Type": "A",
+                "AliasTarget": {
+                  "HostedZoneId": "$ALB_ZONE_ID",
+                  "DNSName": "dualstack.$ALB_DNS",
+                  "EvaluateTargetHealth": true
+                }
+              }
+            }]
+          }
+          EOF
+          
+          echo ""
+          echo "Creating A record:"
+          cat /tmp/a-record.json
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --change-batch file:///tmp/a-record.json
+          
+          echo "✅ A record created!"
+
+      - name: Check Target Group Health
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 TARGET GROUP HEALTH"
+          echo "=========================================="
+          
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "None")
+          
+          if [ "$TG_ARN" = "None" ]; then
+            echo "❌ Target group not found"
+            exit 0
+          fi
+          
+          echo "Target Group: $TG_ARN"
+          echo ""
+          echo "Target Health:"
+          aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table
+
+      - name: Check ECS Service
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 ECS SERVICE STATUS"
+          echo "=========================================="
+          
+          aws ecs describe-services \
+            --cluster adamguard-prod \
+            --services adamguard-prod-service \
+            --query "services[0].[status,runningCount,desiredCount]" \
+            --output table
+          
+          echo ""
+          echo "Tasks:"
+          TASKS=$(aws ecs list-tasks --cluster adamguard-prod --service-name adamguard-prod-service --query "taskArns" --output text)
+          
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks --cluster adamguard-prod --tasks $TASKS --query "tasks[*].[lastStatus,healthStatus]" --output table
+          else
+            echo "❌ No tasks running!"
+          fi
+
+      - name: Final Summary
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          NAMESERVERS="${{ steps.dns.outputs.nameservers }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "📊 SUMMARY & NEXT STEPS"
+          echo "=========================================="
+          echo ""
+          echo "1️⃣  NAMESERVERS (Required in GoDaddy):"
+          echo "$NAMESERVERS" | jq -r '.[]' | while read ns; do
+            echo "   📝 $ns"
+          done
+          echo ""
+          echo "2️⃣  DNS PROPAGATION:"
+          echo "   After setting nameservers, wait 1-2 hours"
+          echo "   Check with: nslookup $DOMAIN"
+          echo ""
+          echo "3️⃣  SSL VALIDATION:"
+          echo "   DNS validation record has been added"
+          echo "   Certificate will be validated automatically"
+          echo ""
+          echo "4️⃣  TEST ACCESS:"
+          echo "   Once DNS propagates: https://$DOMAIN"
+          echo "   Or via ALB directly: http://$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query 'LoadBalancers[0].DNSName' --output text)"
+          echo ""
+          echo "=========================================="

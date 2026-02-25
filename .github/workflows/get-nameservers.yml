@@ -1,0 +1,47 @@
+# Get Nameservers - Quick Output
+name: Get Nameservers
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  get-nameservers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Nameservers
+        run: |
+          echo "=========================================="
+          echo "🌐 ROUTE 53 NAMESERVERS"
+          echo "=========================================="
+          echo ""
+          
+          # List all hosted zones
+          aws route53 list-hosted-zones --query "HostedZones[*].[Name,Id]" --output table
+          
+          echo ""
+          echo "=========================================="
+          
+          # Get nameservers for deeptech-ai.co.uk
+          ZONE_ID=$(aws route53 list-hosted-zones --query "HostedZones[?contains(Name, 'deeptech-ai')].Id" --output text | rev | cut -d'/' -f1 | rev)
+          
+          if [ -n "$ZONE_ID" ]; then
+            echo ""
+            echo "📋 NAMESERVERS FOR DEEPTECH-AI.CO.UK:"
+            echo "=========================================="
+            aws route53 get-hosted-zone --id $ZONE_ID --query "DelegationSet.NameServers" --output json
+            
+            echo ""
+            echo "📝 COPY THESE TO GODADDY:"
+            echo "=========================================="
+            aws route53 get-hosted-zone --id $ZONE_ID --query "DelegationSet.NameServers[]" --output text | tr '\t' '\n'
+          fi

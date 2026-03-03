@@ -1,0 +1,163 @@
+# AdamGuard - Quick Test Task
+
+name: Quick Test Task
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    name: Run Test Task
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Check Image Exists
+        run: |
+          echo "Checking latest image..."
+          aws ecr describe-images --repository-name adamguard-pro --query "sort_by(imageDetails,& imagePushedAt)[-1]" --output table
+
+      - name: Create Simple Task Definition
+        run: |
+          cat > /tmp/simple-task.json << 'EOF'
+          {
+            "family": "adamguard-test",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "app",
+              "image": "${{ steps.ecr.outputs.registry }}/adamguard-pro:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard-test",
+                  "awslogs-region": "us-east-1",
+                  "awslogs-stream-prefix": "test"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/simple-task.json
+
+      - name: Create Log Group
+        run: aws logs create-log-group --log-group-name /ecs/adamguard-test 2>/dev/null || true
+
+      - name: Run Test Task
+        id: task
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[0].SubnetId" --output text)
+          
+          # Get any security group that allows port 3000
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[?IpPermissions[?ToPort==`3000`]].GroupId" --output text | head -1)
+          
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text)
+          fi
+          
+          echo "Subnet: $SUBNETS"
+          echo "Security Group: $SG_ID"
+          
+          # Find cluster
+          CLUSTER=$(aws ecs list-clusters --query "clusterArns[0]" --output text | rev | cut -d'/' -f1 | rev)
+          echo "Cluster: $CLUSTER"
+          
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition adamguard-test \
+            --launch-type FARGATE \
+            --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text)
+          
+          echo "Task: $TASK_ARN"
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+
+      - name: Wait for Task
+        run: |
+          CLUSTER="${{ steps.task.outputs.cluster }}"
+          TASK="${{ steps.task.outputs.task_arn }}"
+          
+          echo "Waiting for task to start (90 seconds)..."
+          sleep 90
+          
+          STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].lastStatus" --output text)
+          echo "Status: $STATUS"
+          
+          if [ "$STATUS" = "STOPPED" ]; then
+            echo ""
+            echo "Task stopped. Checking why..."
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].containers[0]" --output json
+          fi
+
+      - name: Get Task IP and Test
+        run: |
+          CLUSTER="${{ steps.task.outputs.cluster }}"
+          TASK="${{ steps.task.outputs.task_arn }}"
+          
+          STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].lastStatus" --output text)
+          
+          if [ "$STATUS" = "RUNNING" ]; then
+            ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+            
+            echo ""
+            echo "=========================================="
+            echo "✅ TASK RUNNING!"
+            echo "=========================================="
+            echo ""
+            echo "📱 Direct URL: http://$PUBLIC_IP:3000"
+            echo ""
+            echo "Testing connection..."
+            curl -I "http://$PUBLIC_IP:3000" 2>&1 || echo "Connection failed"
+            
+            echo ""
+            echo "Container logs:"
+            sleep 5
+            STREAM=$(aws logs describe-log-streams --log-group-name /ecs/adamguard-test --order-by LastEventTime --descending --limit 1 --query "logStreams[0].logStreamName" --output text)
+            aws logs get-log-events --log-group-name /ecs/adamguard-test --log-stream-name "$STREAM" --limit 30 --query "events[*].message" --output text 2>/dev/null || echo "No logs yet"
+          else
+            echo ""
+            echo "=========================================="
+            echo "❌ TASK NOT RUNNING"
+            echo "=========================================="
+            
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].[lastStatus,stoppedReason,containers[0].[lastStatus,exitCode,reason]]" --output json
+            
+            echo ""
+            echo "Container logs:"
+            STREAM=$(aws logs describe-log-streams --log-group-name /ecs/adamguard-test --order-by LastEventTime --descending --limit 1 --query "logStreams[0].logStreamName" --output text 2>/dev/null || echo "")
+            
+            if [ -n "$STREAM" ]; then
+              aws logs get-log-events --log-group-name /ecs/adamguard-test --log-stream-name "$STREAM" --limit 50 --query "events[*].message" --output text
+            fi
+          fi

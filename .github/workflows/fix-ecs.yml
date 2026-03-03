@@ -1,0 +1,158 @@
+# AdamGuard - Fix ECS Service
+
+name: Fix ECS Service
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  fix-ecs:
+    name: Fix ECS Service
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Check ECS Status
+        run: |
+          echo "=========================================="
+          echo "🔍 ECS SERVICE STATUS"
+          echo "=========================================="
+          
+          # List clusters
+          echo "Clusters:"
+          aws ecs list-clusters --query "clusterArns" --output table
+          
+          # Check service
+          echo ""
+          echo "Service Status:"
+          aws ecs describe-services \
+            --cluster adamguard-prod \
+            --services adamguard-prod-service \
+            --query "services[0].[status,runningCount,desiredCount,pendingCount]" \
+            --output table || echo "Service not found"
+          
+          # Check tasks
+          echo ""
+          echo "Tasks:"
+          TASKS=$(aws ecs list-tasks --cluster adamguard-prod --service-name adamguard-prod-service --query "taskArns" --output text)
+          
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks --cluster adamguard-prod --tasks $TASKS --query "tasks[*].[lastStatus,healthStatus,stoppedReason]" --output table
+          else
+            echo "No tasks found!"
+          fi
+
+      - name: Check Target Group
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 TARGET GROUP HEALTH"
+          echo "=========================================="
+          
+          TG_ARN=$(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName, 'adamguard')].TargetGroupArn" --output text | head -1)
+          
+          if [ -n "$TG_ARN" ]; then
+            echo "Target Group: $TG_ARN"
+            echo ""
+            aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table
+          else
+            echo "No target group found"
+          fi
+
+      - name: Check Recent Logs
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 RECENT LOGS"
+          echo "=========================================="
+          
+          STREAM=$(aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard-prod \
+            --order-by LastEventTime \
+            --descending \
+            --limit 1 \
+            --query "logStreams[0].logStreamName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$STREAM" ] && [ "$STREAM" != "None" ]; then
+            echo "Latest log stream: $STREAM"
+            echo ""
+            aws logs get-log-events \
+              --log-group-name /ecs/adamguard-prod \
+              --log-stream-name "$STREAM" \
+              --limit 50 \
+              --query "events[*].message" \
+              --output text
+          else
+            echo "No logs found"
+          fi
+
+      - name: Restart ECS Service
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔄 RESTARTING ECS SERVICE"
+          echo "=========================================="
+          
+          # Force new deployment
+          aws ecs update-service \
+            --cluster adamguard-prod \
+            --service adamguard-prod-service \
+            --force-new-deployment \
+            --desired-count 2 \
+            --region ${{ env.AWS_REGION }} || echo "Could not update service"
+          
+          echo "Waiting 90 seconds for tasks to start..."
+          sleep 90
+
+      - name: Check New Status
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 NEW SERVICE STATUS"
+          echo "=========================================="
+          
+          aws ecs describe-services \
+            --cluster adamguard-prod \
+            --services adamguard-prod-service \
+            --query "services[0].[status,runningCount,desiredCount]" \
+            --output table
+          
+          TASKS=$(aws ecs list-tasks --cluster adamguard-prod --service-name adamguard-prod-service --query "taskArns" --output text)
+          
+          if [ -n "$TASKS" ]; then
+            echo ""
+            echo "Tasks:"
+            aws ecs describe-tasks --cluster adamguard-prod --tasks $TASKS --query "tasks[*].[lastStatus,healthStatus]" --output table
+          fi
+
+      - name: Get URLs
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📱 ACCESS URLS"
+          echo "=========================================="
+          
+          # Get ALB DNS
+          ALB_DNS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'adamguard')].DNSName" --output text | head -1)
+          
+          echo ""
+          echo "Direct ALB URL:"
+          echo "  http://$ALB_DNS"
+          echo ""
+          echo "Subdomain URL:"
+          echo "  http://adamguard.deeptech-ai.co.uk"
+          echo ""
+          echo "=========================================="

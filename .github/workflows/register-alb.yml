@@ -1,0 +1,154 @@
+# AdamGuard - Register Task with ALB
+# Registers running ECS tasks with the ALB target group
+
+name: Register ALB
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  register:
+    name: Register Tasks with ALB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Running Tasks and Register with ALB
+        run: |
+          echo "=========================================="
+          echo "🔍 FINDING RUNNING TASKS"
+          echo "=========================================="
+
+          CLUSTER="adamguard-app"
+
+          # Get all running tasks
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER --desired-status RUNNING --query "taskArns[*]" --output text 2>/dev/null || echo "")
+
+          if [ -z "$TASKS" ]; then
+            echo "No running tasks found!"
+            exit 1
+          fi
+
+          echo "Found tasks: $TASKS"
+
+          # Get target group ARN
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "")
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            # Try creating target group
+            VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-ssl-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text 2>/dev/null || echo "")
+          fi
+
+          echo "Target Group: $TG_ARN"
+
+          # Get ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "")
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+
+          echo "ALB: $ALB_ARN"
+          echo "ALB DNS: $ALB_DNS"
+
+          # Fix listener
+          LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[*].ListenerArn" --output text 2>/dev/null || echo "")
+          for l in $LISTENERS; do
+            [ -n "$l" ] && [ "$l" != "None" ] && aws elbv2 delete-listener --listener-arn "$l" 2>/dev/null && echo "Deleted listener: $l"
+          done
+
+          sleep 2
+
+          # Create HTTP listener
+          aws elbv2 create-listener \
+            --load-balancer-arn "$ALB_ARN" \
+            --protocol HTTP \
+            --port 80 \
+            --default-actions Type=forward,TargetGroupArn="$TG_ARN" 2>/dev/null || echo "Listener may already exist"
+
+          echo ""
+          echo "=========================================="
+          echo "📋 GETTING TASK IPs"
+          echo "=========================================="
+
+          # Get task IPs and register them
+          TARGETS=""
+          for task in $TASKS; do
+            ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $task --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text 2>/dev/null || echo "")
+
+            if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
+              PRIVATE_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].PrivateIpAddress" --output text 2>/dev/null || echo "")
+
+              if [ -n "$PRIVATE_IP" ] && [ "$PRIVATE_IP" != "None" ]; then
+                echo "Task: $task -> IP: $PRIVATE_IP"
+                if [ -z "$TARGETS" ]; then
+                  TARGETS="Id=$PRIVATE_IP,Port=3000"
+                else
+                  TARGETS="$TARGETS Id=$PRIVATE_IP,Port=3000"
+                fi
+              fi
+            fi
+          done
+
+          if [ -z "$TARGETS" ]; then
+            echo "No task IPs found!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "📝 REGISTERING TARGETS"
+          echo "=========================================="
+
+          echo "Targets: $TARGETS"
+
+          # Register targets
+          aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets $TARGETS
+
+          echo ""
+          echo "Waiting 30 seconds for health checks..."
+          sleep 30
+
+          echo ""
+          echo "=========================================="
+          echo "🏥 TARGET HEALTH"
+          echo "=========================================="
+
+          aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason]" --output table
+
+          echo ""
+          echo "=========================================="
+          echo "🧪 TESTING CONNECTION"
+          echo "=========================================="
+
+          echo ""
+          echo "Testing ALB: http://$ALB_DNS"
+          curl -I "http://$ALB_DNS" --max-time 10 2>&1 || echo "ALB test failed"
+
+          echo ""
+          echo "Testing Subdomain: http://adamguard.deeptech-ai.co.uk"
+          curl -I "http://adamguard.deeptech-ai.co.uk" --max-time 10 2>&1 || echo "Subdomain test failed"
+
+          echo ""
+          echo "=========================================="
+          echo "📱 ACCESS URLS"
+          echo "=========================================="
+          echo ""
+          echo "Direct ALB: http://$ALB_DNS"
+          echo "Subdomain:  http://adamguard.deeptech-ai.co.uk"
+          echo ""

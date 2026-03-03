@@ -5,7 +5,7 @@
   "description": "AdamGuard Pro - AI-Powered Antivirus Dashboard",
   "scripts": {
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "build": "next build && echo 'Copying static files to standalone...' && mkdir -p .next/standalone/.next && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/ && echo 'Static files copied successfully' && ls -la .next/standalone/.next/static/ | head -5",
     "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
     "lint:security": "eslint . --ext .ts,.tsx --rule 'no-eval: error' --rule 'no-implied-eval: error'",

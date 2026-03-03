@@ -25,17 +25,20 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 
 RUN npx prisma generate
+
+# Build the application
+# The build command already copies static and public to standalone folder
 RUN npm run build
 
-# Debug: show build output structure
-RUN echo "=== Build output ===" && \
-    ls -la .next/ && \
-    echo "=== Standalone ===" && \
+# Verify build output
+RUN echo "=== Checking build output ===" && \
     ls -la .next/standalone/ && \
-    echo "=== Static ===" && \
-    ls -la .next/static/ && \
-    echo "=== Standalone .next ===" && \
-    ls -la .next/standalone/.next/ 2>/dev/null || echo "No .next in standalone"
+    echo "=== Checking .next in standalone ===" && \
+    ls -la .next/standalone/.next/ && \
+    echo "=== Checking static in standalone ===" && \
+    ls -la .next/standalone/.next/static/ && \
+    echo "=== Checking public in standalone ===" && \
+    ls -la .next/standalone/public/
 
 # Stage 3: Production
 FROM node:20-alpine AS runner
@@ -52,30 +55,25 @@ ENV DATABASE_URL="file:/app/data/adamguard.db"
 # Create data directory
 RUN mkdir -p /app/data
 
-# Copy standalone build - this includes server.js and needed node_modules
+# Copy entire standalone build (includes server.js, .next, public, node_modules)
 COPY --from=builder /app/.next/standalone ./
 
-# Copy static files to the correct location for standalone
-# Standalone expects static files at ./.next/static
-COPY --from=builder /app/.next/static ./.next/static
-
-# Copy public folder
-COPY --from=builder /app/public ./public
+# Verify files are in place
+RUN echo "=== Verifying final structure ===" && \
+    ls -la && \
+    echo "=== .next folder ===" && \
+    ls -la .next/ && \
+    echo "=== .next/static folder ===" && \
+    ls -la .next/static/ | head -5 && \
+    echo "=== .next/static/chunks folder ===" && \
+    ls -la .next/static/chunks/ | head -10 && \
+    echo "=== public folder ===" && \
+    ls -la public/
 
 # Copy Prisma for database operations
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
-
-# Debug: verify file structure
-RUN echo "=== Final structure ===" && \
-    ls -la && \
-    echo "=== .next folder ===" && \
-    ls -la .next/ && \
-    echo "=== .next/static folder ===" && \
-    ls -la .next/static/ | head -10 && \
-    echo "=== public folder ===" && \
-    ls -la public/
 
 # Initialize database
 RUN npx prisma db push --skip-generate 2>/dev/null || echo "Database will be created on first run"

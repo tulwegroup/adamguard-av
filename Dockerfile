@@ -1,4 +1,5 @@
 # AdamGuard Pro - Production Dockerfile with SQLite
+# Fixed for proper static file serving
 
 # Stage 1: Install dependencies
 FROM node:20-alpine AS deps
@@ -26,8 +27,15 @@ ENV NODE_ENV=production
 RUN npx prisma generate
 RUN npm run build
 
-# Verify build output
-RUN ls -la .next/standalone/ && cat .next/standalone/server.js | head -5
+# Debug: show build output structure
+RUN echo "=== Build output ===" && \
+    ls -la .next/ && \
+    echo "=== Standalone ===" && \
+    ls -la .next/standalone/ && \
+    echo "=== Static ===" && \
+    ls -la .next/static/ && \
+    echo "=== Standalone .next ===" && \
+    ls -la .next/standalone/.next/ 2>/dev/null || echo "No .next in standalone"
 
 # Stage 3: Production
 FROM node:20-alpine AS runner
@@ -44,16 +52,30 @@ ENV DATABASE_URL="file:/app/data/adamguard.db"
 # Create data directory
 RUN mkdir -p /app/data
 
-# Copy standalone build
+# Copy standalone build - this includes server.js and needed node_modules
 COPY --from=builder /app/.next/standalone ./
+
+# Copy static files to the correct location for standalone
+# Standalone expects static files at ./.next/static
 COPY --from=builder /app/.next/static ./.next/static
+
+# Copy public folder
 COPY --from=builder /app/public ./public
+
+# Copy Prisma for database operations
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 
-# Verify server.js exists
-RUN ls -la server.js && node -e "console.log('server.js syntax ok')"
+# Debug: verify file structure
+RUN echo "=== Final structure ===" && \
+    ls -la && \
+    echo "=== .next folder ===" && \
+    ls -la .next/ && \
+    echo "=== .next/static folder ===" && \
+    ls -la .next/static/ | head -10 && \
+    echo "=== public folder ===" && \
+    ls -la public/
 
 # Initialize database
 RUN npx prisma db push --skip-generate 2>/dev/null || echo "Database will be created on first run"
@@ -64,5 +86,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=60s --timeout=30s --start-period=120s --retries=3 \
   CMD curl -f http://localhost:3000/ || exit 1
 
-# Run as root to avoid permission issues (can secure later)
 CMD ["node", "server.js"]

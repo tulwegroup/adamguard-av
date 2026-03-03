@@ -1,0 +1,273 @@
+# AdamGuard - Direct Fix for 504
+# Direct AWS commands to fix the 504 Gateway Timeout
+
+name: Direct Fix 504
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  direct-fix:
+    name: Direct Fix
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Step 1 - Diagnose Current State
+        run: |
+          echo "=========================================="
+          echo "🔍 CURRENT STATE DIAGNOSIS"
+          echo "=========================================="
+          
+          echo ""
+          echo "=== ALBs ==="
+          aws elbv2 describe-load-balancers --query "LoadBalancers[*].[LoadBalancerName,DNSName,State.Code]" --output table
+          
+          echo ""
+          echo "=== Target Groups ==="
+          aws elbv2 describe-target-groups --query "TargetGroups[*].[TargetGroupName,Port,TargetType]" --output table
+          
+          echo ""
+          echo "=== ALB Listeners (adamguard-ssl-alb) ==="
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "none")
+          if [ "$ALB_ARN" != "none" ]; then
+            aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[*].[Port,Protocol,DefaultActions[0].Type]" --output table 2>/dev/null || echo "No listeners"
+          fi
+          
+          echo ""
+          echo "=== Target Health (adamguard-ssl-tg) ==="
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "none")
+          if [ "$TG_ARN" != "none" ]; then
+            aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason]" --output table 2>/dev/null || echo "No targets"
+          fi
+          
+          echo ""
+          echo "=== ECS Tasks ==="
+          for cluster in $(aws ecs list-clusters --query "clusterArns[*]" --output text); do
+            cluster_name=$(echo $cluster | rev | cut -d'/' -f1 | rev)
+            tasks=$(aws ecs list-tasks --cluster $cluster_name --query "taskArns" --output text 2>/dev/null || echo "")
+            if [ -n "$tasks" ]; then
+              echo "Cluster: $cluster_name"
+              aws ecs describe-tasks --cluster $cluster_name --tasks $tasks --query "tasks[*].[lastStatus,containers[0].lastStatus]" --output table 2>/dev/null || true
+            fi
+          done
+
+      - name: Step 2 - Get Network Info
+        id: network
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          
+          # Get public subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=mapPublicIpOnLaunch,Values=true" --query "Subnets[*].SubnetId" --output text)
+          SUBNETS=$(echo $SUBNETS | tr ' ' ',')
+          
+          # If no public subnets, use all
+          if [ -z "$SUBNETS" ]; then
+            SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text | tr ' ' ',')
+          fi
+          
+          # Get security group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "none")
+          
+          if [ "$SG_ID" = "none" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name adamguard-sg --description "AdamGuard" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 2
+          fi
+          
+          # Add rules
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 2>/dev/null || true
+          
+          echo "VPC: $VPC_ID"
+          echo "Subnets: $SUBNETS"
+          echo "SG: $SG_ID"
+          
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "subnets=$SUBNETS" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Step 3 - Fix Target Group
+        id: tg
+        run: |
+          VPC_ID="${{ steps.network.outputs.vpc_id }}"
+          
+          # Get the SSL target group (should exist)
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "none")
+          
+          if [ "$TG_ARN" = "none" ]; then
+            echo "Creating target group..."
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-ssl-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --health-check-interval-seconds 30 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+          
+          echo "Target Group: $TG_ARN"
+          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+
+      - name: Step 4 - Fix ALB Listener
+        run: |
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "none")
+          TG_ARN="${{ steps.tg.outputs.tg_arn }}"
+          
+          if [ "$ALB_ARN" = "none" ]; then
+            echo "ALB not found!"
+            exit 1
+          fi
+          
+          echo "ALB: $ALB_ARN"
+          
+          # Delete existing listeners
+          LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[*].ListenerArn" --output text 2>/dev/null || echo "")
+          for l in $LISTENERS; do
+            [ -n "$l" ] && aws elbv2 delete-listener --listener-arn "$l" 2>/dev/null && echo "Deleted listener: $l"
+          done
+          
+          sleep 2
+          
+          # Create new listener on port 80
+          echo "Creating HTTP listener..."
+          aws elbv2 create-listener \
+            --load-balancer-arn "$ALB_ARN" \
+            --protocol HTTP \
+            --port 80 \
+            --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+          
+          echo "Listener created!"
+
+      - name: Step 5 - Create ECS Service with ALB
+        run: |
+          CLUSTER="adamguard-prod"
+          TG_ARN="${{ steps.tg.outputs.tg_arn }}"
+          SUBNETS="${{ steps.network.outputs.subnets }}"
+          SG_ID="${{ steps.network.outputs.sg_id }}"
+          
+          # Create cluster if needed
+          aws ecs create-cluster --cluster-name $CLUSTER 2>/dev/null || true
+          
+          # Create IAM role if needed
+          if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
+            cat > /tmp/trust.json << 'EOF'
+{"Version": "2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+EOF
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file:///tmp/trust.json 2>/dev/null || true
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy 2>/dev/null || true
+            sleep 10
+          fi
+          
+          # Create log group
+          aws logs create-log-group --log-group-name /ecs/adamguard 2>/dev/null || true
+          
+          # Register task definition
+          ECR_IMAGE="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/adamguard-pro:latest"
+          
+          cat > /tmp/task.json << EOF
+{
+  "family": "adamguard-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+  "containerDefinitions": [{
+    "name": "adamguard-app",
+    "image": "$ECR_IMAGE",
+    "essential": true,
+    "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+    "environment": [
+      {"name": "NODE_ENV", "value": "production"},
+      {"name": "PORT", "value": "3000"}
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/adamguard",
+        "awslogs-region": "${{ env.AWS_REGION }}",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }]
+}
+EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task.json
+          
+          # Delete existing service if any
+          aws ecs delete-service --cluster $CLUSTER --service adamguard-service --force 2>/dev/null && sleep 10 || true
+          
+          # Create service with ALB
+          IFS=',' read -ra SUBS <<< "$SUBNETS"
+          SUB1=${SUBS[0]}
+          SUB2=${SUBS[1]:-${SUBS[0]}}
+          
+          echo "Creating ECS service with ALB..."
+          aws ecs create-service \
+            --cluster $CLUSTER \
+            --service-name adamguard-service \
+            --task-definition adamguard-task \
+            --desired-count 2 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUB1,$SUB2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --load-balancers "targetGroupArn=$TG_ARN,containerName=adamguard-app,containerPort=3000" \
+            --query "service.serviceArn" \
+            --output text
+          
+          echo ""
+          echo "Service created! Waiting 2 minutes for tasks to start..."
+          sleep 120
+
+      - name: Step 6 - Verify Deployment
+        run: |
+          CLUSTER="adamguard-prod"
+          TG_ARN="${{ steps.tg.outputs.tg_arn }}"
+          
+          echo "=========================================="
+          echo "🔍 VERIFICATION"
+          echo "=========================================="
+          
+          echo ""
+          echo "=== Service Status ==="
+          aws ecs describe-services --cluster $CLUSTER --services adamguard-service --query "services[0].[status,runningCount,desiredCount]" --output table 2>/dev/null || echo "Service not found"
+          
+          echo ""
+          echo "=== Task Status ==="
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER --service adamguard-service --query "taskArns[*]" --output text 2>/dev/null || echo "")
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASKS --query "tasks[*].[lastStatus,containers[0].lastStatus]" --output table
+          fi
+          
+          echo ""
+          echo "=== Target Health ==="
+          aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query "TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]" --output table 2>/dev/null || echo "No targets"
+          
+          echo ""
+          echo "=== Connection Test ==="
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].DNSName" --output text)
+          
+          echo "Testing: http://$ALB_DNS"
+          curl -I "http://$ALB_DNS" --max-time 10 2>&1 || echo "Test failed"
+          
+          echo ""
+          echo "=========================================="
+          echo "📱 ACCESS URLS"
+          echo "=========================================="
+          echo "Direct ALB: http://$ALB_DNS"
+          echo "Subdomain:  http://adamguard.deeptech-ai.co.uk"

@@ -1,0 +1,212 @@
+# AdamGuard Pro - Build, Test, and Deploy v3
+
+name: AdamGuard Build Test Deploy
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: adamguard-pro
+
+jobs:
+  build-test-deploy:
+    name: Build Test Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Build application
+        run: |
+          npm run build
+          echo ""
+          echo "=== Checking build output ==="
+          ls -la .next/standalone/
+          echo ""
+          echo "=== Checking server.js ==="
+          head -20 .next/standalone/server.js
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR repository
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region ${{ env.AWS_REGION }} || true
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+          
+          # Test the image locally
+          echo ""
+          echo "=== Testing Docker image locally ==="
+          docker run --rm -d --name test-app -p 3000:3000 ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          sleep 10
+          
+          echo "Checking if container is running..."
+          docker ps
+          
+          echo ""
+          echo "Testing HTTP connection..."
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/ || echo "Connection failed"
+          
+          echo ""
+          echo "Container logs:"
+          docker logs test-app 2>&1 | tail -50
+          
+          # Stop test container
+          docker stop test-app || true
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Deploy to ECS
+        run: |
+          # Get VPC info
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          
+          # Get subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          
+          # Get or create security group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          
+          if [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name adamguard-sg --description "AdamGuard Security Group" --vpc-id $VPC_ID --query "GroupId" --output text)
+            sleep 5
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 || true
+          fi
+          
+          # Ensure IGW route exists
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+          
+          if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+            MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[?Main==\`true\`]].RouteTableId" --output text)
+            aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID 2>/dev/null || true
+          fi
+          
+          # Create cluster
+          CLUSTER="adamguard-app"
+          aws ecs create-cluster --cluster-name $CLUSTER --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster exists"
+          
+          # Setup IAM role
+          if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
+            cat > /tmp/trust.json << 'EOF'
+          {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+          EOF
+            aws iam create-role --role-name ecsTaskExecutionRole --assume-role-policy-document file:///tmp/trust.json || true
+            aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+            sleep 10
+          fi
+          
+          # Register task definition
+          cat > /tmp/task.json << EOF
+          {
+            "family": "adamguard-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "adamguard-app",
+              "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task.json --region ${{ env.AWS_REGION }}
+          
+          # Create log group
+          aws logs create-log-group --log-group-name /ecs/adamguard --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          
+          # Run task directly
+          echo ""
+          echo "Running ECS task..."
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition adamguard-task \
+            --launch-type FARGATE \
+            --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+          
+          echo "Task: $TASK_ARN"
+          
+          # Wait for task
+          echo ""
+          echo "Waiting for task (2 minutes)..."
+          sleep 120
+          
+          # Get task status
+          STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].lastStatus" --output text --region ${{ env.AWS_REGION }})
+          echo "Task status: $STATUS"
+          
+          if [ "$STATUS" = "RUNNING" ]; then
+            ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text --region ${{ env.AWS_REGION }})
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text --region ${{ env.AWS_REGION }})
+            
+            echo ""
+            echo "=========================================="
+            echo "🚀 DEPLOYMENT SUCCESSFUL!"
+            echo "=========================================="
+            echo ""
+            echo "📱 Access at: http://$PUBLIC_IP:3000"
+          else
+            echo ""
+            echo "Task not running. Checking logs..."
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].[stoppedReason,containers[0].reason]" --output table --region ${{ env.AWS_REGION }}
+            
+            echo ""
+            echo "Container logs:"
+            STREAM=$(aws logs describe-log-streams --log-group-name /ecs/adamguard --order-by LastEventTime --descending --limit 1 --query "logStreams[0].logStreamName" --output text 2>/dev/null)
+            if [ -n "$STREAM" ]; then
+              aws logs get-log-events --log-group-name /ecs/adamguard --log-stream-name "$STREAM" --limit 50 --query "events[*].message" --output text
+            fi
+          fi

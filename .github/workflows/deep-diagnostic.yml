@@ -1,0 +1,316 @@
+# AdamGuard Pro - Deep Diagnostic
+# Checks everything to find the issue
+
+name: AdamGuard Deep Diagnostic
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  diagnostic:
+    name: Deep Network Diagnostic
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find Latest Task
+        id: find
+        run: |
+          echo "=========================================="
+          echo "🔍 FINDING LATEST RUNNING TASK"
+          echo "=========================================="
+          
+          # List all clusters
+          echo "All clusters:"
+          aws ecs list-clusters --query "clusterArns" --output table
+          
+          # Find adamguard clusters
+          CLUSTERS=$(aws ecs list-clusters --query "clusterArns[?contains(@, 'adamguard')]" --output text)
+          echo ""
+          echo "AdamGuard clusters: $CLUSTERS"
+          
+          LATEST_TASK=""
+          LATEST_CLUSTER=""
+          
+          for cluster_arn in $CLUSTERS; do
+            cluster_name=$(echo $cluster_arn | rev | cut -d'/' -f1 | rev)
+            echo ""
+            echo "Checking cluster: $cluster_name"
+            
+            TASKS=$(aws ecs list-tasks --cluster $cluster_name --desired-status RUNNING --query "taskArns" --output text 2>/dev/null || echo "")
+            
+            if [ -n "$TASKS" ]; then
+              echo "  Found running tasks: $TASKS"
+              LATEST_TASK=$TASKS
+              LATEST_CLUSTER=$cluster_name
+              break
+            fi
+          done
+          
+          if [ -z "$LATEST_TASK" ]; then
+            echo "No running tasks found! Checking stopped tasks..."
+            
+            for cluster_arn in $CLUSTERS; do
+              cluster_name=$(echo $cluster_arn | rev | cut -d'/' -f1 | rev)
+              TASKS=$(aws ecs list-tasks --cluster $cluster_name --desired-status STOPPED --query "taskArns" --output text 2>/dev/null || echo "")
+              
+              if [ -n "$TASKS" ]; then
+                echo "  Found stopped tasks: $TASKS"
+                LATEST_TASK=$TASKS
+                LATEST_CLUSTER=$cluster_name
+                break
+              fi
+            done
+          fi
+          
+          echo "cluster=$LATEST_CLUSTER" >> $GITHUB_OUTPUT
+          echo "task=$(echo $LATEST_TASK | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          
+      - name: Diagnose Task
+        run: |
+          CLUSTER="${{ steps.find.outputs.cluster }}"
+          TASK="${{ steps.find.outputs.task }}"
+          
+          echo "=========================================="
+          echo "🔍 TASK DIAGNOSTIC"
+          echo "=========================================="
+          echo "Cluster: $CLUSTER"
+          echo "Task: $TASK"
+          
+          if [ -z "$TASK" ] || [ -z "$CLUSTER" ]; then
+            echo "No task found to diagnose!"
+            exit 0
+          fi
+          
+          echo ""
+          echo "Task Details:"
+          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].[lastStatus,healthStatus,stoppedReason]" --output table
+          
+          echo ""
+          echo "Container Details:"
+          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].containers[*].[name,lastStatus,exitCode,reason]" --output table
+          
+          echo ""
+          echo "Network Configuration:"
+          aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].attachments[0].details" --output table
+
+      - name: Get Network Info
+        id: network
+        run: |
+          CLUSTER="${{ steps.find.outputs.cluster }}"
+          TASK="${{ steps.find.outputs.task }}"
+          
+          if [ -z "$TASK" ] || [ -z "$CLUSTER" ]; then
+            echo "No task found"
+            exit 0
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 NETWORK INFO"
+          echo "=========================================="
+          
+          # Get ENI
+          ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          echo "ENI: $ENI_ID"
+          
+          if [ -z "$ENI_ID" ] || [ "$ENI_ID" = "None" ]; then
+            echo "No ENI found!"
+            exit 0
+          fi
+          
+          # Get full ENI details
+          echo ""
+          echo "ENI Details:"
+          aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].[InterfaceType,Status,RequesterManaged]" --output table
+          
+          # Get Public IP
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+          echo ""
+          echo "Public IP: $PUBLIC_IP"
+          
+          # Get Private IP
+          PRIVATE_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].PrivateIpAddress" --output text)
+          echo "Private IP: $PRIVATE_IP"
+          
+          # Get Subnet
+          SUBNET_ID=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].SubnetId" --output text)
+          echo "Subnet: $SUBNET_ID"
+          
+          # Get Security Groups
+          echo ""
+          echo "Security Groups on ENI:"
+          aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Groups[*].[GroupId,GroupName]" --output table
+          
+          SG_IDS=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Groups[*].GroupId" --output text)
+          
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "subnet_id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "sg_ids=$SG_IDS" >> $GITHUB_OUTPUT
+
+      - name: Check Subnet Routing
+        run: |
+          SUBNET_ID="${{ steps.network.outputs.subnet_id }}"
+          
+          if [ -z "$SUBNET_ID" ]; then
+            echo "No subnet found"
+            exit 0
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 SUBNET & ROUTING CHECK"
+          echo "=========================================="
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-subnets --subnet-ids $SUBNET_ID --query "Subnets[0].VpcId" --output text)
+          echo "VPC: $VPC_ID"
+          
+          # Get subnet details
+          echo ""
+          echo "Subnet Details:"
+          aws ec2 describe-subnets --subnet-ids $SUBNET_ID --query "Subnets[0].[AvailabilityZone,MapPublicIpOnLaunch,CidrBlock]" --output table
+          
+          # Get Internet Gateway
+          echo ""
+          echo "Internet Gateways:"
+          aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[*].[InternetGatewayId,Attachments[0].State]" --output table
+          
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+          
+          # Get route tables for this subnet
+          echo ""
+          echo "Route Tables for Subnet:"
+          aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$SUBNET_ID" --query "RouteTables[*].Routes" --output table
+          
+          # Check main route table too
+          echo ""
+          echo "Main Route Table:"
+          MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[?Main==\`true\`]].RouteTableId" --output text)
+          aws ec2 describe-route-tables --route-table-ids $MAIN_RT --query "RouteTables[0].Routes" --output table
+          
+          # Check if route to IGW exists
+          echo ""
+          if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+            ROUTE_CHECK=$(aws ec2 describe-route-tables --route-table-ids $MAIN_RT --query "RouteTables[0].Routes[?GatewayId=='$IGW_ID']" --output text)
+            if [ -n "$ROUTE_CHECK" ] && [ "$ROUTE_CHECK" != "None" ]; then
+              echo "✅ Route to IGW exists in main route table"
+            else
+              echo "❌ NO route to IGW! Adding one..."
+              aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+              echo "✅ Route added!"
+            fi
+          else
+            echo "❌ No Internet Gateway found!"
+          fi
+
+      - name: Check Security Group Rules
+        run: |
+          SG_IDS="${{ steps.network.outputs.sg_ids }}"
+          
+          if [ -z "$SG_IDS" ]; then
+            echo "No security groups found"
+            exit 0
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 SECURITY GROUP RULES"
+          echo "=========================================="
+          
+          for sg_id in $SG_IDS; do
+            echo ""
+            echo "Security Group: $sg_id"
+            echo "Inbound Rules:"
+            aws ec2 describe-security-groups --group-ids $sg_id --query "SecurityGroups[0].IpPermissions" --output table
+            
+            echo ""
+            echo "Outbound Rules:"
+            aws ec2 describe-security-groups --group-ids $sg_id --query "SecurityGroups[0].IpPermissionsEgress" --output table
+          done
+          
+          # Ensure port 3000 is open
+          echo ""
+          echo "Ensuring port 3000 is open on all AdamGuard SGs..."
+          
+          VPC_ID=$(aws ec2 describe-security-groups --group-ids $SG_IDS --query "SecurityGroups[0].VpcId" --output text)
+          
+          for sg_id in $SG_IDS; do
+            aws ec2 authorize-security-group-ingress --group-id $sg_id --protocol tcp --port 3000 --cidr 0.0.0.0/0 2>/dev/null || echo "Port 3000 already open on $sg_id"
+          done
+
+      - name: Check Application Logs
+        run: |
+          CLUSTER="${{ steps.find.outputs.cluster }}"
+          TASK="${{ steps.find.outputs.task }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 APPLICATION LOGS (Last 50 lines)"
+          echo "=========================================="
+          
+          # Get log stream name
+          TASK_ID=$(echo $TASK | rev | cut -d'/' -f1 | rev)
+          
+          echo "Looking for logs with task ID: $TASK_ID"
+          
+          LOG_STREAMS=$(aws logs describe-log-streams \
+            --log-group-name /ecs/adamguard \
+            --log-stream-name-prefix ecs/adamguard-app \
+            --order-by LastEventTime \
+            --descending \
+            --limit 5 \
+            --query "logStreams[*].logStreamName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$LOG_STREAMS" ]; then
+            echo "Found log streams: $LOG_STREAMS"
+            
+            for stream in $LOG_STREAMS; do
+              echo ""
+              echo "=== Log Stream: $stream ==="
+              aws logs get-log-events \
+                --log-group-name /ecs/adamguard \
+                --log-stream-name "$stream" \
+                --limit 50 \
+                --query "events[*].message" \
+                --output text 2>/dev/null || echo "Could not read logs"
+            done
+          else
+            echo "No log streams found"
+          fi
+
+      - name: Final Summary
+        run: |
+          PUBLIC_IP="${{ steps.network.outputs.public_ip }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "📊 DIAGNOSTIC SUMMARY"
+          echo "=========================================="
+          echo ""
+          
+          if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "None" ]; then
+            echo "📱 Application URL: http://$PUBLIC_IP:3000"
+          else
+            echo "⚠️ No public IP found"
+          fi
+          
+          echo ""
+          echo "If still not working, check:"
+          echo "1. Application logs above for errors"
+          echo "2. Task stopped reason"
+          echo "3. Container exit code"
+          echo ""
+          echo "AWS Console Links:"
+          echo "- ECS: https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}"
+          echo "- Log Group: https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/\$252Fecs\$252Fadamguard"

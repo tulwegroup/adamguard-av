@@ -1,0 +1,288 @@
+# AdamGuard Pro - Complete Network Fix
+# Fixes all networking issues for public access
+
+name: AdamGuard Complete Network Fix
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  fix-networking:
+    name: Fix All Networking Issues
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Complete Network Fix
+        id: fix
+        run: |
+          set -e
+          
+          echo "=========================================="
+          echo "🔧 COMPLETE NETWORK FIX"
+          echo "=========================================="
+          
+          # Get VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          echo "VPC: $VPC_ID"
+          
+          # Get subnets (need public subnets)
+          echo ""
+          echo "1. Getting public subnets..."
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=default-for-az,Values=true" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]}
+          echo "Subnets: $SUBNET_1, $SUBNET_2"
+          
+          # ============================================
+          # Create/Update ALB Security Group
+          # ============================================
+          echo ""
+          echo "2. Setting up ALB Security Group..."
+          
+          ALB_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-alb-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$ALB_SG" = "None" ] || [ "$ALB_SG" = "NOT_FOUND" ] || [ -z "$ALB_SG" ]; then
+            echo "Creating ALB security group..."
+            ALB_SG=$(aws ec2 create-security-group \
+              --group-name adamguard-alb-sg \
+              --description "AdamGuard ALB - Public Access" \
+              --vpc-id $VPC_ID \
+              --query "GroupId" \
+              --output text)
+            sleep 3
+          fi
+          
+          echo "ALB Security Group: $ALB_SG"
+          
+          # Add rules to ALB SG
+          echo "Adding inbound rules to ALB SG..."
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80 --cidr 0.0.0.0/0 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 443 --cidr 0.0.0.0/0 2>/dev/null || true
+          
+          # ============================================
+          # Create/Update ECS Tasks Security Group
+          # ============================================
+          echo ""
+          echo "3. Setting up ECS Tasks Security Group..."
+          
+          ECS_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-ecs-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$ECS_SG" = "None" ] || [ "$ECS_SG" = "NOT_FOUND" ] || [ -z "$ECS_SG" ]; then
+            echo "Creating ECS tasks security group..."
+            ECS_SG=$(aws ec2 create-security-group \
+              --group-name adamguard-ecs-sg \
+              --description "AdamGuard ECS Tasks - Internal" \
+              --vpc-id $VPC_ID \
+              --query "GroupId" \
+              --output text)
+            sleep 3
+          fi
+          
+          echo "ECS Security Group: $ECS_SG"
+          
+          # Allow traffic from ALB to ECS on port 3000
+          echo "Adding rule: ALB -> ECS port 3000..."
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --source-group $ALB_SG 2>/dev/null || true
+          
+          # Also allow all inbound from within VPC for debugging
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --cidr 10.0.0.0/8 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --cidr 172.16.0.0/12 2>/dev/null || true
+          aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --cidr 192.168.0.0/16 2>/dev/null || true
+          
+          # ============================================
+          # Update ALB with correct Security Group
+          # ============================================
+          echo ""
+          echo "4. Updating ALB..."
+          
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$ALB_ARN" = "None" ] || [ "$ALB_ARN" = "NOT_FOUND" ] || [ -z "$ALB_ARN" ]; then
+            echo "Creating new ALB..."
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name adamguard-alb \
+              --subnets $SUBNET_1 $SUBNET_2 \
+              --security-groups $ALB_SG \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text)
+          else
+            echo "Updating existing ALB security group..."
+            aws elbv2 set-security-groups --load-balancer-arn $ALB_ARN --security-groups $ALB_SG || true
+          fi
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+          echo "ALB ARN: $ALB_ARN"
+          echo "ALB DNS: $ALB_DNS"
+          
+          # ============================================
+          # Create/Update Target Group
+          # ============================================
+          echo ""
+          echo "5. Setting up Target Group..."
+          
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$TG_ARN" = "None" ] || [ "$TG_ARN" = "NOT_FOUND" ] || [ -z "$TG_ARN" ]; then
+            echo "Creating target group..."
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --health-check-interval-seconds 30 \
+              --health-check-timeout-seconds 10 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 5 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+          
+          echo "Target Group: $TG_ARN"
+          
+          # ============================================
+          # Create/Update Listener
+          # ============================================
+          echo ""
+          echo "6. Setting up Listener..."
+          
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[0].ListenerArn" --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$LISTENER_ARN" = "None" ] || [ "$LISTENER_ARN" = "NOT_FOUND" ] || [ -z "$LISTENER_ARN" ]; then
+            echo "Creating HTTP listener..."
+            aws elbv2 create-listener \
+              --load-balancer-arn $ALB_ARN \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions Type=forward,TargetGroupArn=$TG_ARN || true
+          else
+            echo "Listener exists: $LISTENER_ARN"
+          fi
+          
+          # ============================================
+          # Stop existing service
+          # ============================================
+          echo ""
+          echo "7. Stopping existing ECS service..."
+          
+          SERVICE_STATUS=$(aws ecs describe-services --cluster adamguard-prod --services adamguard-prod-service --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          if [ "$SERVICE_STATUS" = "ACTIVE" ] || [ "$SERVICE_STATUS" = "DRAINING" ]; then
+            echo "Setting desired count to 0..."
+            aws ecs update-service --cluster adamguard-prod --service adamguard-prod-service --desired-count 0 || true
+            sleep 30
+            
+            echo "Deleting service..."
+            aws ecs delete-service --cluster adamguard-prod --service adamguard-prod-service --force || true
+            sleep 30
+          fi
+          
+          # ============================================
+          # Register Task Definition
+          # ============================================
+          echo ""
+          echo "8. Registering Task Definition..."
+          
+          cat > /tmp/task-def.json << EOF
+          {
+            "family": "adamguard-prod-task",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [{
+              "name": "adamguard-app",
+              "image": "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/adamguard-pro:latest",
+              "essential": true,
+              "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+              "environment": [
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "PORT", "value": "3000"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/adamguard-prod",
+                  "awslogs-region": "${{ env.AWS_REGION }}",
+                  "awslogs-stream-prefix": "ecs"
+                }
+              }
+            }]
+          }
+          EOF
+          
+          aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region ${{ env.AWS_REGION }}
+          
+          # ============================================
+          # Create new ECS Service
+          # ============================================
+          echo ""
+          echo "9. Creating ECS Service..."
+          
+          aws ecs create-service \
+            --cluster adamguard-prod \
+            --service-name adamguard-prod-service \
+            --task-definition adamguard-prod-task \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --load-balancers targetGroupArn=$TG_ARN,containerName=adamguard-app,containerPort=3000 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}" \
+            --region ${{ env.AWS_REGION }}
+          
+          echo ""
+          echo "=========================================="
+          echo "✅ NETWORK FIX COMPLETE!"
+          echo "=========================================="
+          echo ""
+          echo "📱 Access your application at:"
+          echo "   http://$ALB_DNS"
+          echo ""
+          
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+
+      - name: Wait for Service Stability
+        run: |
+          echo "Waiting for service to start (3-5 minutes)..."
+          aws ecs wait services-stable --cluster adamguard-prod --services adamguard-prod-service --region ${{ env.AWS_REGION }} || true
+
+      - name: Check Target Health
+        run: |
+          echo ""
+          echo "Checking target health..."
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-tg --query "TargetGroups[0].TargetGroupArn" --output text)
+          
+          for i in {1..10}; do
+            echo "Attempt $i/10..."
+            aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table || true
+            sleep 30
+          done
+
+      - name: Final Status
+        run: |
+          ALB_DNS="${{ steps.fix.outputs.alb_dns }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "🚀 DEPLOYMENT URL"
+          echo "=========================================="
+          echo ""
+          echo "📱 http://$ALB_DNS"
+          echo ""
+          echo "If still not working, check CloudWatch logs:"
+          echo "https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups/log-group/\$252Fecs\$252Fadamguard-prod"

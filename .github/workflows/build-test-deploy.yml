@@ -1,4 +1,5 @@
-# AdamGuard Pro - Build, Test, and Deploy v3
+# AdamGuard Pro - Build, Test, and Deploy v4
+# Now includes SSL/HTTPS support
 
 name: AdamGuard Build Test Deploy
 
@@ -12,12 +13,13 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: adamguard-pro
+  SSL_CERT_ARN: arn:aws:acm:us-east-1:368331615566:certificate/5b3459d7-e0fe-4346-acc4-25c059c36fac
 
 jobs:
   build-test-deploy:
     name: Build Test Deploy
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -62,24 +64,24 @@ jobs:
       - name: Build Docker image
         run: |
           docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
-          
+
           # Test the image locally
           echo ""
           echo "=== Testing Docker image locally ==="
           docker run --rm -d --name test-app -p 3000:3000 ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
           sleep 10
-          
+
           echo "Checking if container is running..."
           docker ps
-          
+
           echo ""
           echo "Testing HTTP connection..."
           curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/ || echo "Connection failed"
-          
+
           echo ""
           echo "Container logs:"
           docker logs test-app 2>&1 | tail -50
-          
+
           # Stop test container
           docker stop test-app || true
 
@@ -88,37 +90,38 @@ jobs:
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
       - name: Deploy to ECS
+        id: deploy
         run: |
           # Get VPC info
           VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
-          
+
           # Get subnets
           SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
           SUBNET_ARRAY=($SUBNETS)
           SUBNET_1=${SUBNET_ARRAY[0]}
           SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
-          
+
           # Get or create security group
           SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
-          
+
           if [ "$SG_ID" = "None" ]; then
             SG_ID=$(aws ec2 create-security-group --group-name adamguard-sg --description "AdamGuard Security Group" --vpc-id $VPC_ID --query "GroupId" --output text)
             sleep 5
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 || true
           fi
-          
+
           # Ensure IGW route exists
           IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
-          
+
           if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
             MAIN_RT=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[?Main==\`true\`]].RouteTableId" --output text)
             aws ec2 create-route --route-table-id $MAIN_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID 2>/dev/null || true
           fi
-          
+
           # Create cluster
           CLUSTER="adamguard-app"
           aws ecs create-cluster --cluster-name $CLUSTER --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Cluster exists"
-          
+
           # Setup IAM role
           if ! aws iam get-role --role-name ecsTaskExecutionRole 2>/dev/null; then
             cat > /tmp/trust.json << 'EOF'
@@ -128,7 +131,7 @@ jobs:
             aws iam attach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
             sleep 10
           fi
-          
+
           # Register task definition
           cat > /tmp/task.json << EOF
           {
@@ -158,12 +161,12 @@ jobs:
             }]
           }
           EOF
-          
+
           aws ecs register-task-definition --cli-input-json file:///tmp/task.json --region ${{ env.AWS_REGION }}
-          
+
           # Create log group
           aws logs create-log-group --log-group-name /ecs/adamguard --region ${{ env.AWS_REGION }} 2>/dev/null || true
-          
+
           # Run task directly
           echo ""
           echo "Running ECS task..."
@@ -176,33 +179,39 @@ jobs:
             --query "tasks[0].taskArn" \
             --output text \
             --region ${{ env.AWS_REGION }})
-          
+
           echo "Task: $TASK_ARN"
-          
+
           # Wait for task
           echo ""
           echo "Waiting for task (2 minutes)..."
           sleep 120
-          
+
           # Get task status
           STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].lastStatus" --output text --region ${{ env.AWS_REGION }})
           echo "Task status: $STATUS"
-          
+
           if [ "$STATUS" = "RUNNING" ]; then
             ENI_ID=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text --region ${{ env.AWS_REGION }})
             PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query "NetworkInterfaces[0].Association.PublicIp" --output text --region ${{ env.AWS_REGION }})
-            
+
             echo ""
             echo "=========================================="
             echo "🚀 DEPLOYMENT SUCCESSFUL!"
             echo "=========================================="
             echo ""
             echo "📱 Access at: http://$PUBLIC_IP:3000"
+
+            echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+            echo "subnet_1=$SUBNET_1" >> $GITHUB_OUTPUT
+            echo "subnet_2=$SUBNET_2" >> $GITHUB_OUTPUT
+            echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+            echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           else
             echo ""
             echo "Task not running. Checking logs..."
             aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].[stoppedReason,containers[0].reason]" --output table --region ${{ env.AWS_REGION }}
-            
+
             echo ""
             echo "Container logs:"
             STREAM=$(aws logs describe-log-streams --log-group-name /ecs/adamguard --order-by LastEventTime --descending --limit 1 --query "logStreams[0].logStreamName" --output text 2>/dev/null)
@@ -210,3 +219,206 @@ jobs:
               aws logs get-log-events --log-group-name /ecs/adamguard --log-stream-name "$STREAM" --limit 50 --query "events[*].message" --output text
             fi
           fi
+
+      - name: Configure SSL and ALB
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔧 CONFIGURING SSL AND ALB"
+          echo "=========================================="
+
+          VPC_ID="${{ steps.deploy.outputs.vpc_id }}"
+          CLUSTER="${{ steps.deploy.outputs.cluster }}"
+
+          # Check SSL certificate status
+          echo ""
+          echo "=== Checking SSL Certificate ==="
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn "${{ env.SSL_CERT_ARN }}" --query "Certificate.Status" --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "Certificate Status: $CERT_STATUS"
+
+          # Get or create ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "")
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            echo "ALB not found, skipping ALB configuration"
+            exit 0
+          fi
+
+          echo "ALB: $ALB_ARN"
+          echo "ALB DNS: $ALB_DNS"
+
+          # Get or create target group
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "")
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            echo "Creating target group..."
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-ssl-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+
+          echo "Target Group: $TG_ARN"
+
+          # Configure SSL if certificate is issued
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo ""
+            echo "=== Configuring HTTPS ==="
+
+            # Create HTTPS listener if not exists
+            HTTPS_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[?Port==\`443\`].ListenerArn" --output text 2>/dev/null || echo "")
+
+            if [ -z "$HTTPS_LISTENER" ] || [ "$HTTPS_LISTENER" = "None" ]; then
+              echo "Creating HTTPS listener..."
+              aws elbv2 create-listener \
+                --load-balancer-arn "$ALB_ARN" \
+                --protocol HTTPS \
+                --port 443 \
+                --certificates CertificateArn="${{ env.SSL_CERT_ARN }}" \
+                --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+              echo "✅ HTTPS listener created!"
+            else
+              echo "HTTPS listener already exists"
+            fi
+
+            # Configure HTTP to HTTPS redirect
+            HTTP_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[?Port==\`80\`].ListenerArn" --output text 2>/dev/null || echo "")
+
+            if [ -n "$HTTP_LISTENER" ] && [ "$HTTP_LISTENER" != "None" ]; then
+              echo "Configuring HTTP to HTTPS redirect..."
+              aws elbv2 modify-listener \
+                --listener-arn "$HTTP_LISTENER" \
+                --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}"
+              echo "✅ HTTP redirect configured!"
+            fi
+          else
+            echo ""
+            echo "⚠️ Certificate not issued (status: $CERT_STATUS), using HTTP only"
+
+            # Ensure HTTP listener forwards to target group
+            HTTP_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[?Port==\`80\`].ListenerArn" --output text 2>/dev/null || echo "")
+
+            if [ -z "$HTTP_LISTENER" ] || [ "$HTTP_LISTENER" = "None" ]; then
+              echo "Creating HTTP listener..."
+              aws elbv2 create-listener \
+                --load-balancer-arn "$ALB_ARN" \
+                --protocol HTTP \
+                --port 80 \
+                --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+            fi
+          fi
+
+          # Register all running ECS tasks with target group
+          echo ""
+          echo "=== Registering ECS Tasks ==="
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER --desired-status RUNNING --query "taskArns[*]" --output text 2>/dev/null || echo "")
+
+          if [ -n "$TASKS" ]; then
+            TARGETS=""
+            for task in $TASKS; do
+              ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $task --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text 2>/dev/null || echo "")
+
+              if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
+                PRIVATE_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].PrivateIpAddress" --output text 2>/dev/null || echo "")
+
+                if [ -n "$PRIVATE_IP" ] && [ "$PRIVATE_IP" != "None" ]; then
+                  echo "Task: $task -> IP: $PRIVATE_IP"
+                  if [ -z "$TARGETS" ]; then
+                    TARGETS="Id=$PRIVATE_IP,Port=3000"
+                  else
+                    TARGETS="$TARGETS Id=$PRIVATE_IP,Port=3000"
+                  fi
+                fi
+              fi
+            done
+
+            if [ -n "$TARGETS" ]; then
+              aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets $TARGETS
+              echo "✅ Targets registered!"
+            fi
+          fi
+
+          # Update Route 53
+          echo ""
+          echo "=== Updating Route 53 ==="
+          ZONE_ID=$(aws route53 list-hosted-zones --query "HostedZones[?contains(Name, 'deeptech-ai.co.uk')].Id" --output text | head -1)
+
+          if [ -n "$ZONE_ID" ] && [ "$ZONE_ID" != "None" ]; then
+            ZONE_ID=$(echo $ZONE_ID | sed 's|/hostedzone/||')
+            ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --query "LoadBalancers[0].CanonicalHostedZoneId" --output text)
+
+            cat > /tmp/route53.json << EOF
+          {
+            "Comment": "Update adamguard DNS",
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "adamguard.deeptech-ai.co.uk",
+                  "Type": "A",
+                  "AliasTarget": {
+                    "HostedZoneId": "$ALB_ZONE_ID",
+                    "DNSName": "dualstack.$ALB_DNS",
+                    "EvaluateTargetHealth": true
+                  }
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "adamguard.deeptech-ai.co.uk",
+                  "Type": "AAAA",
+                  "AliasTarget": {
+                    "HostedZoneId": "$ALB_ZONE_ID",
+                    "DNSName": "dualstack.$ALB_DNS",
+                    "EvaluateTargetHealth": true
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+            aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch file:///tmp/route53.json
+            echo "✅ Route 53 updated!"
+          fi
+
+          # Wait for health checks
+          echo ""
+          echo "Waiting 30 seconds for health checks..."
+          sleep 30
+
+          # Final verification
+          echo ""
+          echo "=========================================="
+          echo "🔍 FINAL VERIFICATION"
+          echo "=========================================="
+
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo ""
+            echo "=== Testing HTTPS ==="
+            curl -I "https://adamguard.deeptech-ai.co.uk" --max-time 10 2>&1 | head -15 || echo "HTTPS test completed"
+          fi
+
+          echo ""
+          echo "=== Testing HTTP ==="
+          curl -I "http://adamguard.deeptech-ai.co.uk" --max-time 10 2>&1 | head -15 || echo "HTTP test completed"
+
+          echo ""
+          echo "=========================================="
+          echo "📱 ACCESS URLS"
+          echo "=========================================="
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "✅ HTTPS: https://adamguard.deeptech-ai.co.uk"
+            echo "✅ HTTP:  http://adamguard.deeptech-ai.co.uk (redirects to HTTPS)"
+          else
+            echo "✅ HTTP:  http://adamguard.deeptech-ai.co.uk"
+            echo "⏳ HTTPS: Certificate pending validation"
+          fi
+          echo ""

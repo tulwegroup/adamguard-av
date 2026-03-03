@@ -13,7 +13,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: adamguard-pro
-  SSL_CERT_ARN: arn:aws:acm:us-east-1:368331615566:certificate/5b3459d7-e0fe-4346-acc4-25c059c36fac
+  DOMAIN: adamguard.deeptech-ai.co.uk
 
 jobs:
   build-test-deploy:
@@ -229,11 +229,62 @@ jobs:
 
           VPC_ID="${{ steps.deploy.outputs.vpc_id }}"
           CLUSTER="${{ steps.deploy.outputs.cluster }}"
+          DOMAIN="${{ env.DOMAIN }}"
 
-          # Check SSL certificate status
+          # Find a valid SSL certificate
           echo ""
-          echo "=== Checking SSL Certificate ==="
-          CERT_STATUS=$(aws acm describe-certificate --certificate-arn "${{ env.SSL_CERT_ARN }}" --query "Certificate.Status" --output text 2>/dev/null || echo "NOT_FOUND")
+          echo "=== Finding Valid SSL Certificate ==="
+
+          # First try to find an ISSUED certificate for the exact domain
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='$DOMAIN' && Status=='ISSUED'].CertificateArn" --output text 2>/dev/null | head -1)
+
+          # If not found, try wildcard certificate
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='*.deeptech-ai.co.uk' && Status=='ISSUED'].CertificateArn" --output text 2>/dev/null | head -1)
+          fi
+
+          # If still not found, try any certificate containing the domain
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?contains(DomainName, 'deeptech-ai.co.uk') && Status=='ISSUED'].CertificateArn" --output text 2>/dev/null | head -1)
+          fi
+
+          CERT_STATUS="NOT_FOUND"
+          if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+            CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.Status" --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "Found certificate: $CERT_ARN"
+            echo "Certificate Status: $CERT_STATUS"
+          fi
+
+          # If no valid certificate, request a new one
+          if [ "$CERT_STATUS" != "ISSUED" ]; then
+            echo ""
+            echo "⚠️ No valid certificate found. Requesting new certificate..."
+
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "$DOMAIN" \
+              --validation-method DNS \
+              --query "CertificateArn" \
+              --output text 2>/dev/null || echo "")
+
+            if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+              echo "New certificate requested: $CERT_ARN"
+              CERT_STATUS="PENDING_VALIDATION"
+
+              echo ""
+              echo "=========================================="
+              echo "⚠️ DNS VALIDATION REQUIRED"
+              echo "=========================================="
+              echo ""
+              echo "Add the following CNAME record to your DNS:"
+              sleep 5
+              aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.DomainValidationOptions[*].ResourceRecord" --output table
+              echo ""
+              echo "After adding the DNS record, wait 5-30 minutes for validation."
+            fi
+          fi
+
+          echo ""
+          echo "Certificate ARN: $CERT_ARN"
           echo "Certificate Status: $CERT_STATUS"
 
           # Get or create ALB
@@ -280,7 +331,7 @@ jobs:
                 --load-balancer-arn "$ALB_ARN" \
                 --protocol HTTPS \
                 --port 443 \
-                --certificates CertificateArn="${{ env.SSL_CERT_ARN }}" \
+                --certificates CertificateArn="$CERT_ARN" \
                 --default-actions Type=forward,TargetGroupArn="$TG_ARN"
               echo "✅ HTTPS listener created!"
             else
@@ -317,12 +368,12 @@ jobs:
           # Register all running ECS tasks with target group
           echo ""
           echo "=== Registering ECS Tasks ==="
-          TASKS=$(aws ecs list-tasks --cluster $CLUSTER --desired-status RUNNING --query "taskArns[*]" --output text 2>/dev/null || echo "")
+          TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --desired-status RUNNING --query "taskArns[*]" --output text 2>/dev/null || echo "")
 
           if [ -n "$TASKS" ]; then
             TARGETS=""
             for task in $TASKS; do
-              ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $task --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text 2>/dev/null || echo "")
+              ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks $task --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text 2>/dev/null || echo "")
 
               if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
                 PRIVATE_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].PrivateIpAddress" --output text 2>/dev/null || echo "")

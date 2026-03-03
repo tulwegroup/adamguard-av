@@ -1,0 +1,315 @@
+# AdamGuard - Enable SSL/HTTPS
+# Configures HTTPS on ALB with SSL certificate
+
+name: Enable SSL
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  enable-ssl:
+    name: Enable SSL/HTTPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Step 1 - Check SSL Certificate
+        id: cert
+        run: |
+          echo "=========================================="
+          echo "🔍 CHECKING SSL CERTIFICATES"
+          echo "=========================================="
+
+          # List all certificates
+          aws acm list-certificates --query "CertificateSummaryList[*].[CertificateArn,DomainName,Status]" --output table
+
+          # Check for existing certificate for our domain
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='adamguard.deeptech-ai.co.uk' || DomainName=='*.deeptech-ai.co.uk'].CertificateArn" --output text 2>/dev/null | head -1)
+
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            # Try to find any certificate for deeptech-ai.co.uk
+            CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?contains(DomainName, 'deeptech-ai.co.uk')].CertificateArn" --output text 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo ""
+            echo "No existing certificate found. Requesting new certificate..."
+
+            # Request new certificate
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "adamguard.deeptech-ai.co.uk" \
+              --subject-alternative-names "*.deeptech-ai.co.uk" \
+              --validation-method DNS \
+              --query "CertificateArn" \
+              --output text)
+
+            echo "New certificate requested: $CERT_ARN"
+            echo ""
+            echo "⚠️ DNS validation required. Getting validation records..."
+
+            sleep 5
+
+            # Get validation records
+            aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.DomainValidationOptions[*].ResourceRecord" --output table
+          fi
+
+          echo ""
+          echo "Using Certificate: $CERT_ARN"
+
+          # Check certificate status
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.Status" --output text 2>/dev/null || echo "UNKNOWN")
+          echo "Certificate Status: $CERT_STATUS"
+
+          echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+          echo "cert_status=$CERT_STATUS" >> $GITHUB_OUTPUT
+
+      - name: Step 2 - Check Certificate Validation
+        run: |
+          CERT_ARN="${{ steps.cert.outputs.cert_arn }}"
+          CERT_STATUS="${{ steps.cert.outputs.cert_status }}"
+
+          echo "=========================================="
+          echo "📋 CERTIFICATE VALIDATION STATUS"
+          echo "=========================================="
+
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "✅ Certificate is ISSUED and ready to use!"
+          else
+            echo ""
+            echo "Certificate Status: $CERT_STATUS"
+            echo ""
+            echo "Getting validation details..."
+
+            aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.[Status,DomainValidationOptions[*].[DomainName,ValidationStatus,ResourceRecord.Name,ResourceRecord.Value]]" --output table
+
+            if [ "$CERT_STATUS" = "PENDING_VALIDATION" ]; then
+              echo ""
+              echo "⚠️ Certificate is pending DNS validation."
+              echo ""
+              echo "Please add the following CNAME records to your DNS:"
+
+              aws acm describe-certificate --certificate-arn "$CERT_ARN" --query "Certificate.DomainValidationOptions[*].ResourceRecord" --output json
+
+              echo ""
+              echo "After adding DNS records, wait for validation (can take 5-30 minutes)."
+              echo "Then run this workflow again."
+            fi
+          fi
+
+      - name: Step 3 - Get ALB Info
+        id: alb
+        run: |
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "")
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names adamguard-ssl-alb --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            echo "ALB not found!"
+            exit 1
+          fi
+
+          echo "ALB ARN: $ALB_ARN"
+          echo "ALB DNS: $ALB_DNS"
+
+          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+
+      - name: Step 4 - Get Target Group
+        id: tg
+        run: |
+          TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "")
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name adamguard-ssl-tg \
+              --protocol HTTP \
+              --port 3000 \
+              --vpc-id $VPC_ID \
+              --target-type ip \
+              --health-check-path "/" \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+
+          echo "Target Group: $TG_ARN"
+          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+
+      - name: Step 5 - Configure HTTPS Listener
+        run: |
+          CERT_ARN="${{ steps.cert.outputs.cert_arn }}"
+          CERT_STATUS="${{ steps.cert.outputs.cert_status }}"
+          ALB_ARN="${{ steps.alb.outputs.alb_arn }}"
+          TG_ARN="${{ steps.tg.outputs.tg_arn }}"
+
+          echo "=========================================="
+          echo "🔧 CONFIGURING HTTPS LISTENER"
+          echo "=========================================="
+
+          if [ "$CERT_STATUS" != "ISSUED" ]; then
+            echo "❌ Certificate is not ISSUED. Current status: $CERT_STATUS"
+            echo "Cannot create HTTPS listener without a valid certificate."
+            echo ""
+            echo "Please complete DNS validation first and run this workflow again."
+            exit 0
+          fi
+
+          # Check if HTTPS listener exists
+          HTTPS_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[?Port==\`443\`].ListenerArn" --output text 2>/dev/null || echo "")
+
+          if [ -n "$HTTPS_LISTENER" ] && [ "$HTTPS_LISTENER" != "None" ]; then
+            echo "HTTPS listener already exists: $HTTPS_LISTENER"
+          else
+            echo "Creating HTTPS listener on port 443..."
+
+            HTTPS_LISTENER=$(aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTPS \
+              --port 443 \
+              --certificates CertificateArn="$CERT_ARN" \
+              --default-actions Type=forward,TargetGroupArn="$TG_ARN" \
+              --query "Listeners[0].ListenerArn" \
+              --output text)
+
+            echo "Created HTTPS listener: $HTTPS_LISTENER"
+          fi
+
+      - name: Step 6 - Configure HTTP to HTTPS Redirect
+        run: |
+          ALB_ARN="${{ steps.alb.outputs.alb_arn }}"
+
+          echo "=========================================="
+          echo "🔧 CONFIGURING HTTP TO HTTPS REDIRECT"
+          echo "=========================================="
+
+          # Get existing HTTP listener
+          HTTP_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[?Port==\`80\`].ListenerArn" --output text 2>/dev/null || echo "")
+
+          if [ -n "$HTTP_LISTENER" ] && [ "$HTTP_LISTENER" != "None" ]; then
+            echo "Found HTTP listener: $HTTP_LISTENER"
+
+            # Modify to redirect to HTTPS
+            aws elbv2 modify-listener \
+              --listener-arn "$HTTP_LISTENER" \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}" 2>/dev/null || echo "Listener modification attempted"
+
+            echo "Configured HTTP to HTTPS redirect"
+          else
+            echo "No HTTP listener found, creating one with redirect..."
+
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}"
+          fi
+
+      - name: Step 7 - Update Route 53
+        run: |
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          ALB_ARN="${{ steps.alb.outputs.alb_arn }}"
+
+          echo "=========================================="
+          echo "🌐 UPDATING ROUTE 53"
+          echo "=========================================="
+
+          # Get hosted zone
+          ZONE_ID=$(aws route53 list-hosted-zones --query "HostedZones[?contains(Name, 'deeptech-ai.co.uk')].Id" --output text | head -1)
+
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            echo "No hosted zone found!"
+            exit 1
+          fi
+
+          ZONE_ID=$(echo $ZONE_ID | sed 's|/hostedzone/||')
+          echo "Zone ID: $ZONE_ID"
+
+          # Get ALB canonical hosted zone ID
+          ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --query "LoadBalancers[0].CanonicalHostedZoneId" --output text)
+
+          # Update A record (alias to ALB)
+          cat > /tmp/route53.json << EOF
+{
+  "Comment": "Update adamguard A record for HTTPS",
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "adamguard.deeptech-ai.co.uk",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "$ALB_ZONE_ID",
+          "DNSName": "dualstack.$ALB_DNS",
+          "EvaluateTargetHealth": true
+        }
+      }
+    },
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "adamguard.deeptech-ai.co.uk",
+        "Type": "AAAA",
+        "AliasTarget": {
+          "HostedZoneId": "$ALB_ZONE_ID",
+          "DNSName": "dualstack.$ALB_DNS",
+          "EvaluateTargetHealth": true
+        }
+      }
+    }
+  ]
+}
+EOF
+
+          aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch file:///tmp/route53.json
+
+          echo "Route 53 updated!"
+
+      - name: Step 8 - Verify Configuration
+        run: |
+          ALB_ARN="${{ steps.alb.outputs.alb_arn }}"
+          CERT_STATUS="${{ steps.cert.outputs.cert_status }}"
+
+          echo "=========================================="
+          echo "🔍 VERIFICATION"
+          echo "=========================================="
+
+          echo ""
+          echo "=== ALB Listeners ==="
+          aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[*].[Port,Protocol,DefaultActions[0].Type]" --output table
+
+          echo ""
+          echo "=== Testing HTTPS ==="
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "Testing: https://adamguard.deeptech-ai.co.uk"
+            curl -I "https://adamguard.deeptech-ai.co.uk" --max-time 10 2>&1 || echo "HTTPS test completed"
+          else
+            echo "⚠️ Certificate not yet issued. HTTPS not available."
+          fi
+
+          echo ""
+          echo "=== Testing HTTP Redirect ==="
+          echo "Testing: http://adamguard.deeptech-ai.co.uk (should redirect to HTTPS)"
+          curl -I "http://adamguard.deeptech-ai.co.uk" --max-time 10 2>&1 | head -10
+
+          echo ""
+          echo "=========================================="
+          echo "📱 ACCESS URLS"
+          echo "=========================================="
+          echo ""
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "✅ HTTPS: https://adamguard.deeptech-ai.co.uk"
+          else
+            echo "⏳ HTTPS: Pending certificate validation"
+          fi
+          echo "HTTP: http://adamguard.deeptech-ai.co.uk (redirects to HTTPS)"
+          echo ""

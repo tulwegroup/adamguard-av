@@ -19,6 +19,9 @@ const nextConfig: NextConfig = {
     '.deeptech-ai.co.uk',
   ],
   
+  // Enable Turbopack for Next.js 16
+  turbopack: {},
+  
   // Ensure static files are properly served
   generateEtags: true,
   
@@ -43,18 +46,6 @@ const nextConfig: NextConfig = {
       ],
     },
   ],
-  
-  // Webpack configuration for better chunk handling
-  webpack: (config, { isServer }) => {
-    // Fix for npm packages that use 'fs' module
-    if (!isServer) {
-      config.resolve.fallback = {
-        ...config.resolve.fallback,
-        fs: false,
-      };
-    }
-    return config;
-  },
 };
 
 export default nextConfig;

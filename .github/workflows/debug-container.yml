@@ -1,0 +1,197 @@
+# AdamGuard - Deep Container Debug
+
+name: Debug Container
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  debug:
+    name: Debug Container Issues
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        run: echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Check All Clusters and Services
+        run: |
+          echo "=========================================="
+          echo "🔍 ALL ECS CLUSTERS"
+          echo "=========================================="
+          
+          CLUSTERS=$(aws ecs list-clusters --query "clusterArns" --output text)
+          
+          for cluster in $CLUSTERS; do
+            cluster_name=$(echo $cluster | rev | cut -d'/' -f1 | rev)
+            echo ""
+            echo "=== Cluster: $cluster_name ==="
+            
+            SERVICES=$(aws ecs list-services --cluster $cluster_name --query "serviceArns" --output text)
+            
+            for service in $SERVICES; do
+              service_name=$(echo $service | rev | cut -d'/' -f1 | rev)
+              echo ""
+              echo "Service: $service_name"
+              aws ecs describe-services --cluster $cluster_name --services $service_name --query "services[0].[status,runningCount,desiredCount]" --output table
+            done
+          done
+
+      - name: Get Latest Container Logs
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 CONTAINER LOGS"
+          echo "=========================================="
+          
+          # Check both log groups
+          for log_group in "/ecs/adamguard-prod" "/ecs/adamguard"; do
+            echo ""
+            echo "--- Log Group: $log_group ---"
+            
+            STREAMS=$(aws logs describe-log-streams \
+              --log-group-name "$log_group" \
+              --order-by LastEventTime \
+              --descending \
+              --limit 3 \
+              --query "logStreams[*].logStreamName" \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$STREAMS" ]; then
+              for stream in $STREAMS; do
+                echo ""
+                echo "Stream: $stream"
+                echo "---"
+                aws logs get-log-events \
+                  --log-group-name "$log_group" \
+                  --log-stream-name "$stream" \
+                  --limit 100 \
+                  --query "events[*].message" \
+                  --output text 2>/dev/null | head -50
+              done
+            else
+              echo "No streams found"
+            fi
+          done
+
+      - name: Check Docker Image
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 ECR IMAGE CHECK"
+          echo "=========================================="
+          
+          aws ecr describe-images \
+            --repository-name adamguard-pro \
+            --query "sort_by(imageDetails,& imagePushedAt)[-1].[imagePushedAt,imageSizeInBytes]" \
+            --output table
+
+      - name: Run Test Task
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🧪 RUNNING TEST TASK"
+          echo "=========================================="
+          
+          # Get VPC info
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text)
+          SUBNET_ARRAY=($SUBNETS)
+          SUBNET_1=${SUBNET_ARRAY[0]}
+          SUBNET_2=${SUBNET_ARRAY[1]:-${SUBNET_ARRAY[0]}}
+          
+          # Get security group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-ecs-ssl-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          if [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=adamguard-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          fi
+          
+          echo "Using SG: $SG_ID"
+          echo "Using Subnets: $SUBNET_1, $SUBNET_2"
+          
+          # Find cluster
+          CLUSTER=$(aws ecs list-clusters --query "clusterArns[0]" --output text | rev | cut -d'/' -f1 | rev)
+          echo "Using Cluster: $CLUSTER"
+          
+          # Run standalone task
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $CLUSTER \
+            --task-definition adamguard-prod-task \
+            --launch-type FARGATE \
+            --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+            --query "tasks[0].taskArn" \
+            --output text 2>/dev/null || echo "FAILED")
+          
+          if [ "$TASK_ARN" = "FAILED" ] || [ -z "$TASK_ARN" ]; then
+            echo "❌ Could not run task. Trying different task definition..."
+            
+            # Try with latest task definition
+            TASK_DEF=$(aws ecs list-task-definitions --query "taskDefinitionArns[-1]" --output text | rev | cut -d'/' -f1 | rev)
+            echo "Using task definition: $TASK_DEF"
+            
+            TASK_ARN=$(aws ecs run-task \
+              --cluster $CLUSTER \
+              --task-definition $TASK_DEF \
+              --launch-type FARGATE \
+              --count 1 \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_1,$SUBNET_2],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+              --query "tasks[0].taskArn" \
+              --output text)
+          fi
+          
+          echo "Task: $TASK_ARN"
+          
+          # Wait and check
+          echo "Waiting 60 seconds..."
+          sleep 60
+          
+          STATUS=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].lastStatus" --output text)
+          echo "Task Status: $STATUS"
+          
+          if [ "$STATUS" = "STOPPED" ]; then
+            echo ""
+            echo "Task stopped. Reason:"
+            aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].[stoppedReason,containers[0].exitCode,containers[0].reason]" --output table
+            
+            # Get the IP anyway
+            ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+            if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
+              PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+              echo "Public IP was: $PUBLIC_IP"
+            fi
+          elif [ "$STATUS" = "RUNNING" ]; then
+            ENI=$(aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+            PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI --query "NetworkInterfaces[0].Association.PublicIp" --output text)
+            
+            echo ""
+            echo "=========================================="
+            echo "✅ TASK IS RUNNING!"
+            echo "=========================================="
+            echo ""
+            echo "📱 Test URL: http://$PUBLIC_IP:3000"
+          fi
+
+      - name: Final Status
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 SUMMARY"
+          echo "=========================================="
+          echo ""
+          echo "Check the logs above for errors."
+          echo ""
+          echo "If container is crashing, check:"
+          echo "  1. Docker image has server.js"
+          echo "  2. Port 3000 is exposed"
+          echo "  3. Environment variables are set"

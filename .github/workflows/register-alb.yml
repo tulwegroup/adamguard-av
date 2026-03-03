@@ -1,5 +1,6 @@
 # AdamGuard - Register Task with ALB and Enable SSL
 # Registers running ECS tasks with the ALB target group and configures HTTPS
+# Updated: SSL configuration with existing certificate
 
 name: Register ALB
 

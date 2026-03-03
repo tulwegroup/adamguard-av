@@ -1,0 +1,281 @@
+# AdamGuard - Setup Subdomain
+# Adds subdomain record for existing domain
+
+name: Setup AdamGuard Subdomain
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdomain:
+        description: 'Subdomain (e.g., adamguard)'
+        required: true
+        default: 'adamguard'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  setup-subdomain:
+    name: Setup Subdomain DNS
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find Hosted Zone
+        id: zone
+        run: |
+          echo "=========================================="
+          echo "🔍 FINDING HOSTED ZONE"
+          echo "=========================================="
+          
+          # List all hosted zones
+          echo "All hosted zones:"
+          aws route53 list-hosted-zones --query "HostedZones[*].[Name,Id]" --output table
+          
+          # Find deeptech-ai.co.uk zone
+          ZONE_ID=$(aws route53 list-hosted-zones --query "HostedZones[?contains(Name, 'deeptech-ai')].Id" --output text | head -1)
+          
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+            echo "❌ No hosted zone found for deeptech-ai.co.uk"
+            exit 1
+          fi
+          
+          # Clean zone ID
+          ZONE_ID=$(echo $ZONE_ID | rev | cut -d'/' -f1 | rev)
+          
+          ZONE_NAME=$(aws route53 get-hosted-zone --id $ZONE_ID --query "HostedZone.Name" --output text)
+          
+          echo ""
+          echo "Found Hosted Zone:"
+          echo "  Name: $ZONE_NAME"
+          echo "  ID: $ZONE_ID"
+          
+          echo "zone_id=$ZONE_ID" >> $GITHUB_OUTPUT
+          echo "zone_name=$ZONE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Get ALB Details
+        id: alb
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🔍 GETTING ALB DETAILS"
+          echo "=========================================="
+          
+          # Find the ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'adamguard')].LoadBalancerArn" --output text | head -1)
+          
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            echo "❌ No ALB found. Checking all load balancers..."
+            aws elbv2 describe-load-balancers --query "LoadBalancers[*].[LoadBalancerName,DNSName]" --output table
+            exit 1
+          fi
+          
+          ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].DNSName" --output text)
+          ALB_ZONE_ID=$(aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --query "LoadBalancers[0].CanonicalHostedZoneId" --output text)
+          
+          echo ""
+          echo "ALB Details:"
+          echo "  DNS: $ALB_DNS"
+          echo "  Zone ID: $ALB_ZONE_ID"
+          
+          echo "alb_dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "alb_zone_id=$ALB_ZONE_ID" >> $GITHUB_OUTPUT
+
+      - name: Check SSL Certificate
+        id: ssl
+        run: |
+          SUBDOMAIN="${{ github.event.inputs.subdomain }}"
+          FULL_DOMAIN="$SUBDOMAIN.deeptech-ai.co.uk"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔍 CHECKING SSL CERTIFICATE"
+          echo "=========================================="
+          
+          # Find certificate for this domain
+          CERT_ARN=$(aws acm list-certificates --query "CertificateSummaryList[?contains(DomainName, '$FULL_DOMAIN')].CertificateArn" --output text | head -1)
+          
+          if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
+            echo "No certificate found for $FULL_DOMAIN, requesting new one..."
+            
+            CERT_ARN=$(aws acm request-certificate \
+              --domain-name "$FULL_DOMAIN" \
+              --validation-method DNS \
+              --subject-alternative-names "*.$FULL_DOMAIN" \
+              --query "CertificateArn" \
+              --output text)
+            
+            echo "Certificate requested: $CERT_ARN"
+            sleep 5
+          fi
+          
+          CERT_STATUS=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.Status" --output text)
+          
+          echo ""
+          echo "Certificate Status: $CERT_STATUS"
+          echo "Certificate ARN: $CERT_ARN"
+          
+          # Get validation info if pending
+          if [ "$CERT_STATUS" = "PENDING_VALIDATION" ]; then
+            echo ""
+            echo "Validation Record:"
+            aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.DomainValidationOptions[0].ResourceRecord" --output json
+            
+            # Add validation record
+            VAL_NAME=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.DomainValidationOptions[0].ResourceRecord.Name" --output text)
+            VAL_VALUE=$(aws acm describe-certificate --certificate-arn $CERT_ARN --query "Certificate.DomainValidationOptions[0].ResourceRecord.Value" --output text)
+            
+            if [ -n "$VAL_NAME" ] && [ "$VAL_NAME" != "None" ]; then
+              echo ""
+              echo "Adding DNS validation record..."
+              
+              ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+              
+              cat > /tmp/validation.json << EOF
+          {
+            "Comment": "SSL validation for $FULL_DOMAIN",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$VAL_NAME",
+                "Type": "CNAME",
+                "TTL": 300,
+                "ResourceRecords": [{"Value": "$VAL_VALUE"}]
+              }
+            }]
+          }
+          EOF
+              
+              aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch file:///tmp/validation.json
+              echo "✅ Validation record added!"
+            fi
+          fi
+          
+          echo "cert_arn=$CERT_ARN" >> $GITHUB_OUTPUT
+          echo "cert_status=$CERT_STATUS" >> $GITHUB_OUTPUT
+
+      - name: Create Subdomain A Record
+        run: |
+          SUBDOMAIN="${{ github.event.inputs.subdomain }}"
+          ZONE_ID="${{ steps.zone.outputs.zone_id }}"
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          ALB_ZONE_ID="${{ steps.alb.outputs.alb_zone_id }}"
+          
+          FULL_DOMAIN="$SUBDOMAIN.deeptech-ai.co.uk"
+          
+          echo ""
+          echo "=========================================="
+          echo "🔧 CREATING SUBDOMAIN A RECORD"
+          echo "=========================================="
+          echo ""
+          echo "Subdomain: $FULL_DOMAIN"
+          echo "Pointing to: $ALB_DNS"
+          
+          cat > /tmp/a-record.json << EOF
+          {
+            "Comment": "AdamGuard subdomain",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "$FULL_DOMAIN.",
+                "Type": "A",
+                "AliasTarget": {
+                  "HostedZoneId": "$ALB_ZONE_ID",
+                  "DNSName": "dualstack.$ALB_DNS",
+                  "EvaluateTargetHealth": true
+                }
+              }
+            }]
+          }
+          EOF
+          
+          echo "Record configuration:"
+          cat /tmp/a-record.json
+          
+          aws route53 change-resource-record-sets --hosted-zone-id $ZONE_ID --change-batch file:///tmp/a-record.json
+          
+          echo ""
+          echo "✅ A record created!"
+
+      - name: Update HTTPS Listener
+        run: |
+          SUBDOMAIN="${{ github.event.inputs.subdomain }}"
+          FULL_DOMAIN="$SUBDOMAIN.deeptech-ai.co.uk"
+          
+          CERT_ARN="${{ steps.ssl.outputs.cert_arn }}"
+          CERT_STATUS="${{ steps.ssl.outputs.cert_status }}"
+          ALB_ARN=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'adamguard')].LoadBalancerArn" --output text | head -1)
+          
+          echo ""
+          echo "=========================================="
+          echo "🔧 UPDATING HTTPS LISTENER"
+          echo "=========================================="
+          
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "Certificate is issued, updating HTTPS listener..."
+            
+            # Check if HTTPS listener exists
+            HTTPS_LISTENER=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query "Listeners[?Protocol=='HTTPS'].ListenerArn" --output text)
+            
+            if [ -z "$HTTPS_LISTENER" ] || [ "$HTTPS_LISTENER" = "None" ]; then
+              echo "Creating HTTPS listener..."
+              
+              TG_ARN=$(aws elbv2 describe-target-groups --names adamguard-ssl-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "")
+              
+              if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+                TG_ARN=$(aws elbv2 describe-target-groups --query "TargetGroups[0].TargetGroupArn" --output text | head -1)
+              fi
+              
+              aws elbv2 create-listener \
+                --load-balancer-arn $ALB_ARN \
+                --protocol HTTPS \
+                --port 443 \
+                --certificates CertificateArn=$CERT_ARN \
+                --default-actions Type=forward,TargetGroupArn=$TG_ARN
+              
+              echo "✅ HTTPS listener created!"
+            else
+              echo "HTTPS listener exists, updating certificate..."
+              aws elbv2 modify-listener --listener-arn $HTTPS_LISTENER --certificates CertificateArn=$CERT_ARN || true
+              echo "✅ Certificate updated!"
+            fi
+          else
+            echo "⚠️ Certificate not yet issued (status: $CERT_STATUS)"
+            echo "HTTPS listener will be created once certificate is validated."
+          fi
+
+      - name: Final Status
+        run: |
+          SUBDOMAIN="${{ github.event.inputs.subdomain }}"
+          FULL_DOMAIN="$SUBDOMAIN.deeptech-ai.co.uk"
+          ALB_DNS="${{ steps.alb.outputs.alb_dns }}"
+          CERT_STATUS="${{ steps.ssl.outputs.cert_status }}"
+          
+          echo ""
+          echo "=========================================="
+          echo "✅ SUBDOMAIN SETUP COMPLETE"
+          echo "=========================================="
+          echo ""
+          echo "📱 Your subdomain:"
+          echo "   http://$FULL_DOMAIN"
+          echo ""
+          
+          if [ "$CERT_STATUS" = "ISSUED" ]; then
+            echo "🔒 SSL is active:"
+            echo "   https://$FULL_DOMAIN"
+          else
+            echo "⏳ SSL Status: $CERT_STATUS"
+            echo "   Run this workflow again in 5-10 minutes to complete HTTPS setup"
+          fi
+          
+          echo ""
+          echo "📋 Direct ALB access (works now):"
+          echo "   http://$ALB_DNS"
+          echo ""
+          echo "=========================================="
